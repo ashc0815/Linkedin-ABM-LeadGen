@@ -13,8 +13,10 @@ from src.config import load_settings
 
 console = Console()
 app = typer.Typer(name="abm", help="LinkedIn ABM lead generation agent.")
-pipeline_app = typer.Typer(help="Pipeline commands.")
+pipeline_app = typer.Typer(help="Pipeline commands for LinkedIn ABM outreach.")
 app.add_typer(pipeline_app, name="pipeline")
+mark_app = typer.Typer(help="Manually update contact/company status.")
+pipeline_app.add_typer(mark_app, name="mark")
 
 
 FIELD_LABELS: dict[str, str] = {
@@ -2086,6 +2088,189 @@ def pipeline_stats(
         f"  Estimated pipeline: AUD {total_value:,} "
         f"({stats['meetings']} meetings x AUD {meeting_value:,})"
     )
+
+
+# ---------------------------------------------------------------------------
+# pipeline mark (subcommands)
+# ---------------------------------------------------------------------------
+
+_TOUCH_SENT_STATUS = {
+    "day1": "day1_sent",
+    "day7": "day7_sent",
+    "day14": "day14_sent",
+    "day21": "day21_sent",
+}
+
+
+def _find_contact_record(bitable, contact_name: str):
+    """Find a contact by name. Returns (record_id, Contact) or exits."""
+    from src.bitable_client import CONTACT_FIELD_MAP
+    from src.models import Contact
+
+    col = CONTACT_FIELD_MAP["name"]
+    formula = f'CurrentValue.[{col}] = "{contact_name}"'
+    records = bitable.list_records(bitable.contacts_table_id, filter_formula=formula)
+    if not records:
+        console.print(f"[red]Contact not found: {contact_name}[/red]")
+        raise typer.Exit(1)
+    rec = records[0]
+    ct = bitable._fields_to_contact(rec.get("fields", {}))
+    return rec["record_id"], ct
+
+
+def _update_company_outreach(bitable, company_name: str, new_status: str, only_if_all: bool = False):
+    """Update the company's outreach_status. If only_if_all=True, only update
+    when ALL contacts at that company share the target dm_status."""
+    from src.bitable_client import COMPANY_FIELD_MAP, CONTACT_FIELD_MAP
+    from src.models import Company
+
+    col = COMPANY_FIELD_MAP["company_name"]
+    formula = f'CurrentValue.[{col}] = "{company_name}"'
+    co_records = bitable.list_records(bitable.companies_table_id, filter_formula=formula)
+    if not co_records:
+        return
+
+    if only_if_all:
+        ct_col = CONTACT_FIELD_MAP["company_name"]
+        ct_formula = f'CurrentValue.[{ct_col}] = "{company_name}"'
+        ct_records = bitable.list_records(bitable.contacts_table_id, filter_formula=ct_formula)
+        statuses = set()
+        for r in ct_records:
+            try:
+                c = bitable._fields_to_contact(r.get("fields", {}))
+                statuses.add(c.dm_status)
+            except Exception:
+                pass
+        # Only update if all contacts are rejected
+        if statuses != {"rejected"}:
+            return
+
+    co_rec = co_records[0]
+    outreach_col = COMPANY_FIELD_MAP["outreach_status"]
+    bitable.update_record(
+        bitable.companies_table_id,
+        co_rec["record_id"],
+        {outreach_col: new_status},
+    )
+
+
+def _make_bitable(settings):
+    from src.bitable_client import BitableClient
+    return BitableClient(
+        app_id=settings.feishu_app_id,
+        app_secret=settings.feishu_app_secret,
+        app_token=settings.feishu_bitable_app_token,
+        companies_table_id=settings.feishu_companies_table_id,
+        contacts_table_id=settings.feishu_contacts_table_id,
+    )
+
+
+@mark_app.command("sent")
+def mark_sent(
+    contact: str = typer.Option(..., "--contact", help="Contact name"),
+    touch: str = typer.Option(..., "--touch", help="Touch point: day1, day7, day14, day21"),
+) -> None:
+    """Mark a DM as manually sent."""
+    from datetime import datetime, timedelta, timezone
+
+    if touch not in _TOUCH_SENT_STATUS:
+        console.print(f"[red]Invalid touch: {touch}[/red]")
+        raise typer.Exit(1)
+
+    settings = load_settings()
+    bitable = _make_bitable(settings)
+    record_id, ct = _find_contact_record(bitable, contact)
+
+    now = datetime.now(timezone.utc)
+    ct.dm_status = _TOUCH_SENT_STATUS[touch]
+    ct.last_touch_date = now
+    ct.touch_count += 1
+
+    next_days = 7 if touch != "day21" else 0
+    if next_days:
+        ct.next_touch_date = now + timedelta(days=next_days)
+    else:
+        ct.next_touch_date = None
+
+    # Update sent_at in dm_drafts
+    for d in ct.dm_drafts:
+        if d.get("touch") == touch and not d.get("sent_at"):
+            d["sent_at"] = now.isoformat()
+            break
+
+    fields = bitable._contact_to_fields(ct)
+    bitable.update_record(bitable.contacts_table_id, record_id, fields)
+
+    next_str = ct.next_touch_date.strftime("%Y-%m-%d") if ct.next_touch_date else "—"
+    console.print(
+        f"[green]Marked {touch.replace('day', 'Day ')} sent for {contact}. "
+        f"Next touch: {next_str}[/green]"
+    )
+
+
+@mark_app.command("replied")
+def mark_replied(
+    contact: str = typer.Option(..., "--contact", help="Contact name"),
+    summary: str = typer.Option("", "--summary", help="Reply summary"),
+) -> None:
+    """Mark a contact as having replied."""
+    settings = load_settings()
+    bitable = _make_bitable(settings)
+    record_id, ct = _find_contact_record(bitable, contact)
+
+    ct.dm_status = "replied"
+    ct.reply_summary = summary
+
+    fields = bitable._contact_to_fields(ct)
+    bitable.update_record(bitable.contacts_table_id, record_id, fields)
+
+    _update_company_outreach(bitable, ct.company_name, "已回复")
+
+    console.print(
+        f"[bold green]{contact} replied![/bold green] "
+        f"Summary saved. Consider scheduling a meeting."
+    )
+
+
+@mark_app.command("rejected")
+def mark_rejected(
+    contact: str = typer.Option(..., "--contact", help="Contact name"),
+) -> None:
+    """Mark a contact as opted out."""
+    settings = load_settings()
+    bitable = _make_bitable(settings)
+    record_id, ct = _find_contact_record(bitable, contact)
+
+    ct.dm_status = "rejected"
+
+    fields = bitable._contact_to_fields(ct)
+    bitable.update_record(bitable.contacts_table_id, record_id, fields)
+
+    # Only mark company as rejected if ALL contacts at that company are rejected
+    _update_company_outreach(bitable, ct.company_name, "已拒绝", only_if_all=True)
+
+    console.print(
+        f"[red]{contact} opted out.[/red] No further messages will be sent."
+    )
+
+
+@mark_app.command("meeting")
+def mark_meeting(
+    contact: str = typer.Option(..., "--contact", help="Contact name"),
+) -> None:
+    """Mark a contact as having a meeting booked."""
+    settings = load_settings()
+    bitable = _make_bitable(settings)
+    record_id, ct = _find_contact_record(bitable, contact)
+
+    ct.dm_status = "meeting_booked"
+
+    fields = bitable._contact_to_fields(ct)
+    bitable.update_record(bitable.contacts_table_id, record_id, fields)
+
+    _update_company_outreach(bitable, ct.company_name, "已约meeting")
+
+    console.print(f"[bold green]Meeting booked with {contact}![/bold green]")
 
 
 # ---------------------------------------------------------------------------
