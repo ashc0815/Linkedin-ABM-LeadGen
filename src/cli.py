@@ -1531,6 +1531,211 @@ def pipeline_push_dms(
 
 
 # ---------------------------------------------------------------------------
+# pipeline check-acceptances
+# ---------------------------------------------------------------------------
+
+
+@pipeline_app.command("check-acceptances")
+def pipeline_check_acceptances(
+    withdraw_after_days: int = typer.Option(14, help="Withdraw connection request after N days"),
+) -> None:
+    """Check pending cold_new connection requests for acceptance or timeout."""
+    from datetime import date, datetime, timedelta, timezone
+
+    from src.bitable_client import CONTACT_FIELD_MAP, BitableClient
+    from src.models import Contact
+    from src.unipile_client import UnipileClient
+
+    settings = load_settings()
+    unipile_ready = all([settings.unipile_api_key, settings.unipile_dsn, settings.unipile_account_id])
+    if not unipile_ready:
+        console.print("[red]Unipile credentials not set. Aborting.[/red]")
+        raise typer.Exit(1)
+
+    feishu_ready = all([
+        settings.feishu_app_id,
+        settings.feishu_app_secret,
+        settings.feishu_bitable_app_token,
+        settings.feishu_contacts_table_id,
+    ])
+    if not feishu_ready:
+        console.print("[red]Feishu Bitable credentials not fully configured. Aborting.[/red]")
+        raise typer.Exit(1)
+
+    bitable = BitableClient(
+        app_id=settings.feishu_app_id,
+        app_secret=settings.feishu_app_secret,
+        app_token=settings.feishu_bitable_app_token,
+        companies_table_id=settings.feishu_companies_table_id,
+        contacts_table_id=settings.feishu_contacts_table_id,
+    )
+    unipile = UnipileClient(
+        api_key=settings.unipile_api_key,
+        dsn=settings.unipile_dsn,
+        account_id=settings.unipile_account_id,
+    )
+
+    # ---- 1. Fetch cold_new contacts with day1_sent ----
+    status_col = CONTACT_FIELD_MAP["dm_status"]
+    flow_col = CONTACT_FIELD_MAP["flow_type"]
+    formula = (
+        f'AND(CurrentValue.[{status_col}] = "day1_sent", '
+        f'CurrentValue.[{flow_col}] = "cold_new")'
+    )
+    raw = bitable.list_records(bitable.contacts_table_id, filter_formula=formula)
+
+    contacts: list[tuple[str, Contact]] = []
+    for rec in raw:
+        try:
+            ct = bitable._fields_to_contact(rec.get("fields", {}))
+            contacts.append((rec["record_id"], ct))
+        except Exception:
+            pass
+
+    if not contacts:
+        console.print("[yellow]No pending cold_new connection requests found.[/yellow]")
+        raise typer.Exit(0)
+
+    console.print(f"\n[bold]Checking {len(contacts)} pending connection requests...[/bold]\n")
+
+    # ---- 2. Check each contact ----
+    accepted_count = 0
+    waiting_count = 0
+    withdrawn_count = 0
+    replied_count = 0
+    waiting_days: list[int] = []
+    today = date.today()
+    now = datetime.now(timezone.utc)
+
+    result_table = Table(title="Connection Request Status")
+    result_table.add_column("Contact", style="cyan", max_width=20)
+    result_table.add_column("Company", max_width=18)
+    result_table.add_column("Sent", width=10)
+    result_table.add_column("Days", justify="center", width=5)
+    result_table.add_column("Status", justify="center", max_width=20)
+
+    for idx, (record_id, ct) in enumerate(contacts, 1):
+        pid = ct.linkedin_provider_id
+        if not pid:
+            console.print(f"  [dim][{idx}] {ct.name} — no provider_id, skipping[/dim]")
+            continue
+
+        # Calculate days since sent
+        if ct.last_touch_date:
+            days_waiting = (today - ct.last_touch_date.date()).days
+        else:
+            days_waiting = 0
+
+        sent_date_str = ct.last_touch_date.strftime("%Y-%m-%d") if ct.last_touch_date else "—"
+
+        # Check if connection was accepted
+        is_connected = unipile.check_is_connection(pid)
+
+        if is_connected:
+            # ---- ACCEPTED ----
+            ct.is_existing_connection = True
+
+            # Check if they replied (sent a message back)
+            has_reply = False
+            if ct.unipile_chat_id:
+                try:
+                    messages = unipile.get_messages(ct.unipile_chat_id)
+                    # Look for messages not sent by Tony (i.e. inbound)
+                    for msg in messages:
+                        sender = msg.get("sender_id") or msg.get("from_attendee", {}).get("provider_id", "")
+                        if sender and sender != "self" and sender == pid:
+                            has_reply = True
+                            break
+                except Exception:
+                    pass
+
+            if has_reply:
+                ct.dm_status = "replied"
+                replied_count += 1
+                status_badge = "[bold green]Accepted + Replied![/bold green]"
+                console.print(
+                    f"  [cyan][{idx}][/cyan] {ct.name} — [bold green]ACCEPTED + REPLIED[/bold green] "
+                    f"(operator action needed)"
+                )
+            else:
+                ct.dm_status = "day7_queued"
+                accepted_count += 1
+                status_badge = "[green]Accepted → Day 7 queue[/green]"
+                console.print(f"  [cyan][{idx}][/cyan] {ct.name} — [green]ACCEPTED[/green] → Day 7 queue")
+
+            # Update Bitable
+            try:
+                fields = bitable._contact_to_fields(ct)
+                bitable.update_record(bitable.contacts_table_id, record_id, fields)
+            except Exception as exc:
+                console.print(f"    [red]Bitable update failed: {exc}[/red]")
+
+            result_table.add_row(ct.name[:20], ct.company_name[:18], sent_date_str, str(days_waiting), status_badge)
+
+        elif days_waiting >= withdraw_after_days:
+            # ---- WITHDRAW ----
+            withdrawn_ok = False
+            inv_id = unipile.find_invitation_for(pid)
+            if inv_id:
+                withdrawn_ok = unipile.withdraw_invitation(inv_id)
+
+            if withdrawn_ok:
+                ct.dm_status = "not_started"
+                ct.next_touch_date = now + timedelta(days=30)
+                ct.reply_summary = (
+                    f"{ct.reply_summary}; " if ct.reply_summary else ""
+                ) + f"Connection request withdrawn after {days_waiting} days. Retry later."
+                withdrawn_count += 1
+                status_badge = f"[red]Withdrawn ({days_waiting}d)[/red]"
+                console.print(
+                    f"  [cyan][{idx}][/cyan] {ct.name} — [red]WITHDRAWN[/red] "
+                    f"after {days_waiting} days (retry in 30 days)"
+                )
+            else:
+                # Couldn't find/withdraw invitation — still mark for retry
+                ct.dm_status = "not_started"
+                ct.next_touch_date = now + timedelta(days=30)
+                ct.reply_summary = (
+                    f"{ct.reply_summary}; " if ct.reply_summary else ""
+                ) + f"Withdrawal attempted after {days_waiting} days (invitation not found). Retry later."
+                withdrawn_count += 1
+                status_badge = f"[red]Reset ({days_waiting}d)[/red]"
+                console.print(
+                    f"  [cyan][{idx}][/cyan] {ct.name} — [red]RESET[/red] "
+                    f"after {days_waiting} days (invitation not found, retry in 30 days)"
+                )
+
+            try:
+                fields = bitable._contact_to_fields(ct)
+                bitable.update_record(bitable.contacts_table_id, record_id, fields)
+            except Exception as exc:
+                console.print(f"    [red]Bitable update failed: {exc}[/red]")
+
+            result_table.add_row(ct.name[:20], ct.company_name[:18], sent_date_str, str(days_waiting), status_badge)
+
+        else:
+            # ---- WAITING ----
+            waiting_count += 1
+            waiting_days.append(days_waiting)
+            status_badge = f"[yellow]Waiting ({days_waiting}d)[/yellow]"
+            console.print(f"  [cyan][{idx}][/cyan] {ct.name} — [yellow]waiting[/yellow] ({days_waiting} days)")
+
+            result_table.add_row(ct.name[:20], ct.company_name[:18], sent_date_str, str(days_waiting), status_badge)
+
+    # ---- 3. Summary ----
+    console.print()
+    console.print(result_table)
+
+    avg_waiting = sum(waiting_days) // len(waiting_days) if waiting_days else 0
+    console.print(f"\n[bold]Checked {len(contacts)} pending connections:[/bold]")
+    console.print(f"  [green]Accepted: {accepted_count}[/green] (moved to Day 7 queue)")
+    if replied_count:
+        console.print(f"  [bold green]Replied: {replied_count}[/bold green] (operator action needed!)")
+    console.print(f"  [yellow]Waiting: {waiting_count}[/yellow] (avg {avg_waiting} days)")
+    console.print(f"  [red]Withdrawn: {withdrawn_count}[/red] (will retry in 30 days)")
+
+
+# ---------------------------------------------------------------------------
 # pipeline scores
 # ---------------------------------------------------------------------------
 

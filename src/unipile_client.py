@@ -271,6 +271,20 @@ class UnipileClient:
             return []
         return data.get("items") or data.get("invitations") or []
 
+    def find_invitation_for(self, provider_id: str) -> str | None:
+        """Find the invitation_id for a pending connection request to provider_id."""
+        invitations = self.check_pending_invitations()
+        for inv in invitations:
+            invitee = (
+                inv.get("provider_id")
+                or inv.get("attendee_id")
+                or inv.get("invitee", {}).get("provider_id")
+                or ""
+            )
+            if invitee == provider_id:
+                return inv.get("id") or inv.get("invitation_id")
+        return None
+
     def withdraw_invitation(self, invitation_id: str) -> bool:
         """Withdraw a pending connection request."""
         try:
