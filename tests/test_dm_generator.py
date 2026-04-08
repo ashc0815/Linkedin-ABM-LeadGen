@@ -7,6 +7,9 @@ import pytest
 from src.dm_generator import (
     DMGenerator,
     _build_context_block,
+    _build_shared_prompt,
+    _get_style,
+    _load_style,
     _validate_dm,
     make_draft_entry,
 )
@@ -41,56 +44,115 @@ def _ct(**kw) -> Contact:
     return Contact(**defaults)
 
 
+@pytest.fixture()
+def style():
+    return _get_style()
+
+
+# ---------------------------------------------------------------------------
+# YAML style loading
+# ---------------------------------------------------------------------------
+
+
+class TestStyleLoading:
+    def test_loads_yaml(self):
+        s = _get_style()
+        assert "persona" in s
+        assert "voice" in s
+        assert "touch_strategy" in s
+
+    def test_persona_fields(self):
+        s = _get_style()
+        assert s["persona"]["name"] == "Tony"
+        assert "Hitpoint" in s["persona"]["company"]
+
+    def test_blacklist_in_voice(self):
+        s = _get_style()
+        blacklist = [p.lower() for p in s["voice"]["blacklist"]]
+        assert "leverage" in blacklist
+        assert "synergy" in blacklist
+
+    def test_industry_angles(self):
+        s = _get_style()
+        assert "Manufacturing" in s["industry_angles"]
+        assert "Mining" in s["industry_angles"]
+
+    def test_touch_strategy_both_flows(self):
+        s = _get_style()
+        assert "re_activation" in s["touch_strategy"]
+        assert "cold_new" in s["touch_strategy"]
+        for flow in ("re_activation", "cold_new"):
+            for touch in ("day1", "day7", "day14", "day21"):
+                assert touch in s["touch_strategy"][flow], f"Missing {flow}/{touch}"
+
+
+# ---------------------------------------------------------------------------
+# _build_shared_prompt
+# ---------------------------------------------------------------------------
+
+
+class TestBuildSharedPrompt:
+    def test_includes_persona(self, style):
+        prompt = _build_shared_prompt(style)
+        assert "Tony" in prompt
+        assert "Hitpoint" in prompt
+
+    def test_includes_rules(self, style):
+        prompt = _build_shared_prompt(style)
+        assert "Australian English" in prompt
+        assert "leverage" in prompt.lower()
+
+
 # ---------------------------------------------------------------------------
 # _build_context_block
 # ---------------------------------------------------------------------------
 
 
 class TestBuildContext:
-    def test_includes_industry_pain_points(self):
-        ctx = _build_context_block(_ct(), _co(industry="Manufacturing"))
-        assert "cross-border expense compliance" in ctx
-
-    def test_includes_mining_pain_points(self):
-        ctx = _build_context_block(_ct(), _co(industry="Mining"))
-        assert "FIFO" in ctx
-
-    def test_includes_education_pain_points(self):
-        ctx = _build_context_block(_ct(), _co(industry="Education"))
-        assert "FBT" in ctx
-
-    def test_concur_yes_angle(self):
-        ctx = _build_context_block(_ct(), _co(uses_concur="Yes"))
-        assert "optimisation" in ctx or "health-check" in ctx
-
-    def test_sap_yes_no_concur_angle(self):
-        ctx = _build_context_block(_ct(), _co(sap_user="Yes", uses_concur="No"))
-        assert "natural extension" in ctx
-
-    def test_overseas_offices(self):
-        ctx = _build_context_block(_ct(), _co(has_overseas_offices=True))
+    def test_includes_industry_pain_points(self, style):
+        ctx = _build_context_block(_ct(), _co(industry="Manufacturing"), style)
         assert "cross-border" in ctx
 
-    def test_recent_news(self):
+    def test_includes_mining_pain_points(self, style):
+        ctx = _build_context_block(_ct(), _co(industry="Mining"), style)
+        assert "FIFO" in ctx
+
+    def test_includes_education_pain_points(self, style):
+        ctx = _build_context_block(_ct(), _co(industry="Education"), style)
+        assert "FBT" in ctx
+
+    def test_concur_yes_angle(self, style):
+        ctx = _build_context_block(_ct(), _co(uses_concur="Yes"), style)
+        assert "optimisation" in ctx.lower() or "health" in ctx.lower()
+
+    def test_sap_yes_no_concur_angle(self, style):
+        ctx = _build_context_block(_ct(), _co(sap_user="Yes", uses_concur="No"), style)
+        assert "natural extension" in ctx
+
+    def test_overseas_offices(self, style):
+        ctx = _build_context_block(_ct(), _co(has_overseas_offices=True), style)
+        assert "cross-border" in ctx.lower() or "Cross-border" in ctx
+
+    def test_recent_news(self, style):
         co = _co(enrichment_signals={"recent_news": [{"title": "Acme acquires XYZ"}]})
-        ctx = _build_context_block(_ct(), co)
+        ctx = _build_context_block(_ct(), co, style)
         assert "Acme acquires XYZ" in ctx
 
-    def test_expansion_detected(self):
+    def test_expansion_detected(self, style):
         co = _co(enrichment_signals={
             "recent_news": [{"title": "Acme expansion into Asia", "description": "new offices"}]
         })
-        ctx = _build_context_block(_ct(), co)
-        assert "scaling T&E" in ctx
+        ctx = _build_context_block(_ct(), co, style)
+        assert "scaling" in ctx.lower() or "Scaling" in ctx
 
-    def test_contact_profile_included(self):
+    def test_contact_profile_included(self, style):
         ct = _ct(profile_summary="20 years in finance across APAC")
-        ctx = _build_context_block(ct, _co())
+        ctx = _build_context_block(ct, _co(), style)
         assert "20 years in finance" in ctx
 
-    def test_no_context_returns_fallback(self):
+    def test_no_context_returns_fallback(self, style):
         co = _co(industry="Other", employee_count=0)
-        ctx = _build_context_block(_ct(), co)
+        ctx = _build_context_block(_ct(), co, style)
         assert "No additional context" in ctx
 
 
@@ -126,8 +188,8 @@ class TestValidateDM:
         ok, reason = _validate_dm(text, "day14")
         assert ok is False
 
-    def test_day1_over_300_chars_allowed(self):
-        """Day 1 re-activation doesn't have 300-char limit."""
+    def test_day1_reactivation_over_500_chars_allowed(self):
+        """day1_reactivation limit is 500 chars."""
         text = "C" * 400
         ok, _ = _validate_dm(text, "day1")
         assert ok is True
@@ -242,7 +304,6 @@ class TestDMGenerator:
                           return_value=self._mock_api_response(bad)):
             result = gen.generate_dm(_ct(), _co(), "day1")
 
-        # After 3 attempts (1 + 2 retries), returns last attempt anyway
         assert result == bad
 
     def test_invalid_touch_raises(self):
@@ -282,9 +343,9 @@ class TestDMGenerator:
             gen.generate_dm(_ct(flow_type="cold_new"), _co(), "day1")
 
         assert len(prompts) == 2
-        # Re-activation mentions "reconnection", cold mentions "connection request"
-        assert "reconnect" in prompts[0].lower()
-        assert "connection request" in prompts[1].lower() or "connection-request" in prompts[1].lower()
+        # Re-activation mentions reconnection, cold mentions cold outreach
+        assert "re-activation" in prompts[0].lower() or "1st-degree" in prompts[0]
+        assert "cold" in prompts[1].lower()
 
 
 # ---------------------------------------------------------------------------

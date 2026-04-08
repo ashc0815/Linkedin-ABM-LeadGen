@@ -1,10 +1,11 @@
-"""DM generation via Anthropic Claude API with quality validation."""
+"""DM generation via Anthropic Claude API with YAML-driven style configuration."""
 
 from __future__ import annotations
 
 import logging
 import re
 from datetime import datetime, timezone
+from pathlib import Path
 
 import anthropic
 
@@ -13,205 +14,140 @@ from src.models import Company, Contact
 logger = logging.getLogger(__name__)
 
 MAX_RETRIES = 2
-
-# Words/phrases that produce generic, low-quality DMs
-_BLACKLIST_PHRASES = [
-    "i hope this finds you well",
-    "i hope this message finds you",
-    "leverage",
-    "synergy",
-    "touch base",
-    "circle back",
-    "low-hanging fruit",
-    "paradigm",
-    "deep dive",
-]
-
-# Industry → pain-point mapping for prompt context
-_INDUSTRY_PAIN_POINTS: dict[str, str] = {
-    "Manufacturing": (
-        "cross-border expense compliance, per diem management by country, "
-        "multi-currency T&E reconciliation"
-    ),
-    "Mining": (
-        "remote workforce T&E, FIFO expense tracking, "
-        "site-based approvals for high-cost logistics"
-    ),
-    "Education": (
-        "FBT (Fringe Benefits Tax) obligations, salary packaging compliance, "
-        "research grant expense acquittal"
-    ),
-    "Professional Services": (
-        "client-billable expense recovery, multi-entity consolidation, "
-        "real-time project cost visibility"
-    ),
-}
-
-# --------------------------------------------------------------------------
-# System prompts
-# --------------------------------------------------------------------------
-
-_SHARED_CONTEXT = """\
-You are ghostwriting a LinkedIn DM on behalf of Tony, CEO of Hitpoint Solution.
-Hitpoint is an SAP Concur implementation and optimisation partner covering \
-Australia, New Zealand, and Greater China.
-
-Rules:
-- Australian English spelling (organisation, optimisation, colour).
-- Maximum 4 sentences per DM.
-- Be conversational, not corporate. No buzzwords.
-- Never start with "I hope this finds you well" or similar generic openers.
-- Never use the words: leverage, synergy, touch base, circle back.
-- Do NOT reveal that you researched the recipient (no "I noticed…", "I saw that…").
-- Weave context naturally as if Tony already knows the industry well.
-- Sign off as "Tony" (no surname, no title).
-"""
-
-_RE_ACTIVATION_PROMPTS: dict[str, str] = {
-    "day1": """\
-{shared}
-
-TASK: Write a Day 1 re-activation DM to {name} ({title} at {company}).
-Tony and {name} are already 1st-degree LinkedIn connections.
-Strategy: Warm reconnection. Reference something specific and genuine \
-(their role, company, or industry), then ask a soft, open-ended question. \
-No selling. No Concur mention. Just re-establish the relationship.
-
-{context}
-""",
-    "day7": """\
-{shared}
-
-TASK: Write a Day 7 follow-up to {name} ({title} at {company}).
-Strategy: Share a useful industry insight or observation. No pitch. \
-Keep under 300 characters. Position Tony as someone who thinks about \
-{industry} challenges.
-
-{context}
-""",
-    "day14": """\
-{shared}
-
-TASK: Write a Day 14 follow-up to {name} ({title} at {company}).
-Strategy: Offer something concrete and free — a Concur Health Check, \
-an FBT compliance guide, a benchmark report, or a quick policy review. \
-Mention it as something Tony does for peers, not as a sales offer. \
-Keep under 300 characters.
-
-{context}
-""",
-    "day21": """\
-{shared}
-
-TASK: Write a Day 21 final follow-up to {name} ({title} at {company}).
-Strategy: Direct but respectful ask for a 15-minute call. Include \
-[CALENDLY_LINK] as the booking link placeholder. Keep it short. \
-Acknowledge they're busy.
-
-{context}
-""",
-}
-
-_COLD_NEW_PROMPTS: dict[str, str] = {
-    "day1": """\
-{shared}
-
-TASK: Write a Day 1 connection-request note to {name} ({title} at {company}).
-Tony does NOT know {name}. This accompanies a LinkedIn connection request.
-Strategy: Ultra-short (2-3 sentences max). Lead with an industry-specific \
-pain point, not with Tony's credentials. End with why connecting makes sense.
-Must be under 300 characters (LinkedIn note limit).
-
-{context}
-""",
-    "day7": """\
-{shared}
-
-TASK: Write a Day 7 follow-up to {name} ({title} at {company}).
-The connection request was accepted. This is the first real message.
-Strategy: Share a relevant compliance change, industry stat, or \
-practical tip. No selling. Keep under 300 characters.
-
-{context}
-""",
-    "day14": """\
-{shared}
-
-TASK: Write a Day 14 follow-up to {name} ({title} at {company}).
-Strategy: Deliver specific free value — a benchmark, template, or \
-guide relevant to their role. Keep under 300 characters.
-
-{context}
-""",
-    "day21": """\
-{shared}
-
-TASK: Write a Day 21 final follow-up to {name} ({title} at {company}).
-Strategy: Last touch. Brief, direct. Offer a 15-minute call with \
-[CALENDLY_LINK]. No pressure, no guilt. 2-3 sentences max.
-
-{context}
-""",
-}
+_STYLE_PATH = Path(__file__).parent / "dm_style.yaml"
 
 
 # --------------------------------------------------------------------------
-# Context builder
+# Style loading
 # --------------------------------------------------------------------------
 
 
-def _build_context_block(contact: Contact, company: Company) -> str:
-    """Build the {context} section for the prompt."""
+def _load_style(path: Path | None = None) -> dict:
+    """Load dm_style.yaml. Returns parsed dict."""
+    import yaml  # lazy import — only needed here
+
+    p = path or _STYLE_PATH
+    with p.open(encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def _get_style() -> dict:
+    """Cached style loader — reloads on file change."""
+    mtime = _STYLE_PATH.stat().st_mtime if _STYLE_PATH.exists() else 0
+    if not hasattr(_get_style, "_cache") or _get_style._mtime != mtime:
+        _get_style._cache = _load_style()
+        _get_style._mtime = mtime
+    return _get_style._cache
+
+
+# --------------------------------------------------------------------------
+# Prompt builder (from YAML)
+# --------------------------------------------------------------------------
+
+
+def _build_shared_prompt(style: dict) -> str:
+    """Build the shared system prompt from style config."""
+    p = style["persona"]
+    v = style["voice"]
+
+    rules = [
+        f"{v['language']}.",
+        f"Tone: {v['tone']}",
+        f"Maximum {v['max_sentences']} sentences per DM.",
+        f"Sign off as \"{v['sign_off']}\" — no surname, no title.",
+    ]
+    for phrase in v.get("blacklist", []):
+        rules.append(f"Never use: \"{phrase}\".")
+    for avoid in v.get("avoid", []):
+        rules.append(avoid)
+    for prefer in v.get("prefer", []):
+        rules.append(prefer)
+
+    rules_block = "\n".join(f"- {r}" for r in rules)
+
+    return (
+        f"You are ghostwriting a LinkedIn DM on behalf of {p['name']}, "
+        f"{p['role']} of {p['company']}.\n"
+        f"{p['company']} is a {p['product']} partner covering {p['coverage']}.\n\n"
+        f"Rules:\n{rules_block}\n"
+    )
+
+
+def _build_task_prompt(
+    style: dict,
+    contact: Contact,
+    company: Company,
+    touch: str,
+) -> str:
+    """Build the task-specific part of the prompt from style config."""
+    flow = contact.flow_type
+    first_name = contact.name.split()[0] if contact.name else "there"
+
+    strategy = style["touch_strategy"].get(flow, {}).get(touch, "")
+    limits = style.get("limits", {})
+
+    # Determine char limit for this touch
+    limit_key = f"{touch}_{flow}" if f"{touch}_{flow}" in limits else touch
+    if touch == "day1" and flow == "cold_new":
+        limit_key = "day1_cold"
+    elif touch == "day1" and flow == "re_activation":
+        limit_key = "day1_reactivation"
+    char_limit = limits.get(limit_key, 500)
+
+    task = (
+        f"TASK: Write a {touch.replace('day', 'Day ')} "
+        f"{'re-activation' if flow == 're_activation' else 'cold outreach'} DM "
+        f"to {first_name} ({contact.title} at {company.company_name}).\n"
+    )
+    if flow == "re_activation":
+        task += f"{contact.name.split()[0]} and Tony are already 1st-degree connections.\n"
+    if strategy:
+        task += f"Strategy: {strategy}\n"
+    if char_limit <= 300:
+        task += f"HARD LIMIT: Keep under {char_limit} characters.\n"
+
+    return task
+
+
+def _build_context_block(contact: Contact, company: Company, style: dict) -> str:
+    """Build enrichment context from company signals + style config."""
     parts: list[str] = []
 
-    # Industry pain points
-    pain = _INDUSTRY_PAIN_POINTS.get(company.industry)
-    if pain:
-        parts.append(f"Industry pain points for {company.industry}: {pain}")
-
-    # Concur / SAP angle
-    if company.uses_concur == "Yes":
+    # Industry angles from YAML
+    ind_cfg = style.get("industry_angles", {}).get(company.industry, {})
+    if ind_cfg:
         parts.append(
-            "Angle: They already use SAP Concur — position Tony as an "
-            "optimisation/health-check expert, not a new vendor."
-        )
-    elif company.sap_user == "Yes":
-        parts.append(
-            "Angle: They use SAP but not Concur — position Concur as "
-            "a natural extension of their SAP investment."
+            f"Industry ({company.industry}): {ind_cfg.get('pain_points', '')}. "
+            f"Angle: {ind_cfg.get('angle', '')}."
         )
 
-    # Overseas / expansion
-    if company.has_overseas_offices:
-        parts.append(
-            "They have overseas offices — cross-border T&E compliance "
-            "and multi-entity rollout are relevant angles."
-        )
+    # Signal angles from YAML
+    signal_angles = style.get("signal_angles", {})
+    if company.uses_concur == "Yes" and "uses_concur_yes" in signal_angles:
+        parts.append(f"Angle: {signal_angles['uses_concur_yes']}")
+    elif company.sap_user == "Yes" and "sap_no_concur" in signal_angles:
+        parts.append(f"Angle: {signal_angles['sap_no_concur']}")
 
-    # News
+    if company.has_overseas_offices and "overseas_offices" in signal_angles:
+        parts.append(f"Angle: {signal_angles['overseas_offices']}")
+
     news = company.enrichment_signals.get("recent_news", [])
     if news:
         titles = [n.get("title", "") for n in news[:2]]
-        parts.append(
-            f"Recent company news (weave naturally, don't say 'I saw'): "
-            f"{'; '.join(titles)}"
-        )
+        parts.append(f"Recent news (weave naturally, don't say 'I saw'): {'; '.join(titles)}")
+        for n in news:
+            text = (n.get("title", "") + " " + n.get("description", "")).lower()
+            if "expansion" in text or "acquisition" in text or "merger" in text:
+                if "expansion_news" in signal_angles:
+                    parts.append(f"Angle: {signal_angles['expansion_news']}")
+                break
 
-    # Expansion / M&A
-    for n in news:
-        text = (n.get("title", "") + " " + n.get("description", "")).lower()
-        if "expansion" in text or "acquisition" in text or "merger" in text:
-            parts.append(
-                "M&A or expansion detected — angle: scaling T&E processes "
-                "to new entities and geographies."
-            )
-            break
+    if company.enrichment_signals.get("concur_job_postings") and "concur_job_postings" in signal_angles:
+        parts.append(f"Angle: {signal_angles['concur_job_postings']}")
 
-    # Employee count
     if company.employee_count:
         parts.append(f"Company size: ~{company.employee_count} employees.")
 
-    # Contact profile
     if contact.profile_summary:
         parts.append(f"Contact bio: {contact.profile_summary[:200]}")
 
@@ -223,24 +159,32 @@ def _build_context_block(contact: Contact, company: Company) -> str:
 # --------------------------------------------------------------------------
 
 
-def _validate_dm(text: str, touch: str) -> tuple[bool, str]:
-    """Validate DM quality. Returns (ok, reason)."""
-    # Blacklist check
+def _validate_dm(text: str, touch: str, style: dict | None = None) -> tuple[bool, str]:
+    """Validate DM quality against style rules. Returns (ok, reason)."""
+    s = style or _get_style()
+    blacklist = [p.lower() for p in s.get("voice", {}).get("blacklist", [])]
+
     lower = text.lower()
-    for phrase in _BLACKLIST_PHRASES:
+    for phrase in blacklist:
         if phrase in lower:
             return False, f"Contains blacklisted phrase: '{phrase}'"
 
-    # Length check for short touches
-    if touch in ("day7", "day14") and len(text) > 300:
-        return False, f"Too long for {touch}: {len(text)} chars (max 300)"
-
-    # Day 1 cold_new connection note also has 300 char limit
-    # (handled in prompt but double-check)
+    # Length limits from YAML
+    # Keys like "day7: 300" apply to all flows for that touch.
+    # Keys like "day1_cold: 300" / "day1_reactivation: 500" are flow-specific.
+    # For validation without knowing flow, use the most generous limit available.
+    limits = s.get("limits", {})
+    candidates = [
+        limits[k] for k in (touch, f"{touch}_cold", f"{touch}_reactivation")
+        if k in limits
+    ]
+    if candidates:
+        max_limit = max(candidates)  # most generous limit for this touch
+        if len(text) > max_limit:
+            return False, f"Too long for {touch}: {len(text)} chars (max {max_limit})"
 
     # Unreplaced template variables
     if "{" in text and "}" in text:
-        # Allow [CALENDLY_LINK] which uses brackets
         stripped = text.replace("[CALENDLY_LINK]", "")
         if re.search(r"\{[^}]+\}", stripped):
             return False, "Contains unreplaced template variable"
@@ -254,15 +198,17 @@ def _validate_dm(text: str, touch: str) -> tuple[bool, str]:
 
 
 class DMGenerator:
-    """Generate personalised LinkedIn DMs using Claude API."""
+    """Generate personalised LinkedIn DMs using Claude API + YAML style config."""
 
     def __init__(
         self,
         anthropic_api_key: str,
         model: str = "claude-sonnet-4-20250514",
+        style_path: Path | None = None,
     ) -> None:
         self._client = anthropic.Anthropic(api_key=anthropic_api_key)
         self.model = model
+        self._style = _load_style(style_path) if style_path else _get_style()
 
     def generate_dm(
         self,
@@ -270,40 +216,21 @@ class DMGenerator:
         company: Company,
         touch: str,
     ) -> str:
-        """Generate a DM for the given touch point.
+        """Generate a DM for the given touch point."""
+        flow = contact.flow_type
+        if touch not in self._style.get("touch_strategy", {}).get(flow, {}):
+            raise ValueError(f"Invalid touch: {touch!r} for flow {flow!r}")
 
-        Args:
-            contact: The target contact.
-            company: The contact's company.
-            touch: One of "day1", "day7", "day14", "day21".
+        shared = _build_shared_prompt(self._style)
+        task = _build_task_prompt(self._style, contact, company, touch)
+        context = _build_context_block(contact, company, self._style)
+        system_prompt = f"{shared}\n{task}\n{context}"
 
-        Returns:
-            The generated DM text.
-        """
-        prompt_map = (
-            _RE_ACTIVATION_PROMPTS
-            if contact.flow_type == "re_activation"
-            else _COLD_NEW_PROMPTS
-        )
-
-        if touch not in prompt_map:
-            raise ValueError(f"Invalid touch: {touch!r}")
-
-        context_block = _build_context_block(contact, company)
-        system_prompt = prompt_map[touch].format(
-            shared=_SHARED_CONTEXT,
-            name=contact.name.split()[0] if contact.name else "there",
-            title=contact.title,
-            company=company.company_name,
-            industry=company.industry,
-            context=context_block,
-        )
-
-        for attempt in range(1, MAX_RETRIES + 2):  # 1 initial + MAX_RETRIES
+        for attempt in range(1, MAX_RETRIES + 2):
             raw = self._call_api(system_prompt)
             dm_text = raw.strip().strip('"').strip("'").strip()
 
-            ok, reason = _validate_dm(dm_text, touch)
+            ok, reason = _validate_dm(dm_text, touch, self._style)
             if ok:
                 return dm_text
 
@@ -312,7 +239,6 @@ class DMGenerator:
                 attempt, MAX_RETRIES + 1, reason,
             )
 
-        # Return last attempt even if imperfect
         logger.error("DM validation failed after all retries, returning last attempt")
         return dm_text
 
