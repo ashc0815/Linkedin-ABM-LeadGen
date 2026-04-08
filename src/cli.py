@@ -934,6 +934,201 @@ def pipeline_enrich(
 
 
 # ---------------------------------------------------------------------------
+# pipeline generate-dms
+# ---------------------------------------------------------------------------
+
+# Maps touch → the dm_status contacts must be in to receive that touch
+_TOUCH_STATUS_MAP: dict[str, str] = {
+    "day1": "not_started",
+    "day7": "day1_sent",
+    "day14": "day7_sent",
+    "day21": "day14_sent",
+}
+
+
+@pipeline_app.command("generate-dms")
+def pipeline_generate_dms(
+    touch: str = typer.Option(..., help="Touch point: day1, day7, day14, day21"),
+    batch_size: int = typer.Option(10, help="Max contacts to process"),
+    flow_type: Optional[str] = typer.Option(None, "--flow-type", help="Filter by flow_type (re_activation or cold_new)"),
+    contact_name: Optional[str] = typer.Option(None, "--contact", help="Generate for a single contact by name"),
+    regenerate: bool = typer.Option(False, "--regenerate", help="Overwrite existing drafts for this touch"),
+    min_score: int = typer.Option(0, "--min-score", help="Only contacts with lead_score >= this"),
+) -> None:
+    """Generate personalised LinkedIn DMs using Claude."""
+    from datetime import date
+
+    from src.bitable_client import CONTACT_FIELD_MAP, COMPANY_FIELD_MAP, BitableClient
+    from src.dm_generator import DMGenerator, make_draft_entry
+    from src.models import Company, Contact
+
+    if touch not in _TOUCH_STATUS_MAP:
+        console.print(f"[red]Invalid touch: {touch!r}. Must be day1/day7/day14/day21.[/red]")
+        raise typer.Exit(1)
+
+    settings = load_settings()
+    if not settings.anthropic_api_key:
+        console.print("[red]ANTHROPIC_API_KEY not set. Aborting.[/red]")
+        raise typer.Exit(1)
+
+    feishu_ready = all([
+        settings.feishu_app_id,
+        settings.feishu_app_secret,
+        settings.feishu_bitable_app_token,
+        settings.feishu_companies_table_id,
+        settings.feishu_contacts_table_id,
+    ])
+    if not feishu_ready:
+        console.print("[red]Feishu Bitable credentials not fully configured. Aborting.[/red]")
+        raise typer.Exit(1)
+
+    bitable = BitableClient(
+        app_id=settings.feishu_app_id,
+        app_secret=settings.feishu_app_secret,
+        app_token=settings.feishu_bitable_app_token,
+        companies_table_id=settings.feishu_companies_table_id,
+        contacts_table_id=settings.feishu_contacts_table_id,
+    )
+    generator = DMGenerator(anthropic_api_key=settings.anthropic_api_key)
+
+    # ---- 1. Build company lookup ----
+    console.print("[bold]Loading companies...[/bold]")
+    raw_co = bitable.list_records(bitable.companies_table_id)
+    companies_map: dict[str, Company] = {}
+    for rec in raw_co:
+        try:
+            c = bitable._fields_to_company(rec.get("fields", {}))
+            companies_map[c.company_name] = c
+        except Exception:
+            pass
+
+    # ---- 2. Query contacts ----
+    required_status = _TOUCH_STATUS_MAP[touch]
+
+    if contact_name:
+        col = CONTACT_FIELD_MAP["name"]
+        formula = f'CurrentValue.[{col}] = "{contact_name}"'
+    else:
+        col = CONTACT_FIELD_MAP["dm_status"]
+        formula = f'CurrentValue.[{col}] = "{required_status}"'
+
+        # For day7+ add next_touch_date filter
+        if touch != "day1":
+            today_str = date.today().isoformat()
+            date_col = CONTACT_FIELD_MAP["next_touch_date"]
+            formula = f'AND({formula}, CurrentValue.[{date_col}] <= "{today_str}")'
+
+        # Add flow_type filter if specified
+        if flow_type:
+            flow_col = CONTACT_FIELD_MAP["flow_type"]
+            formula = f'AND({formula}, CurrentValue.[{flow_col}] = "{flow_type}")'
+
+    raw_contacts = bitable.list_records(bitable.contacts_table_id, filter_formula=formula)
+
+    # Parse into (record_id, Contact)
+    candidates: list[tuple[str, Contact]] = []
+    for rec in raw_contacts:
+        try:
+            ct = bitable._fields_to_contact(rec.get("fields", {}))
+            if ct.lead_score >= min_score:
+                candidates.append((rec["record_id"], ct))
+        except Exception:
+            pass
+
+    # Sort by lead_score descending, apply batch_size
+    candidates.sort(key=lambda x: x[1].lead_score, reverse=True)
+    candidates = candidates[:batch_size]
+
+    if not candidates:
+        console.print(f"[yellow]No contacts found for {touch} (status={required_status}).[/yellow]")
+        raise typer.Exit(0)
+
+    console.print(
+        f"\n[bold]Generating {touch} DMs for {len(candidates)} contacts...[/bold]\n"
+    )
+
+    # ---- 3. Generate DMs ----
+    generated = 0
+    reactivation_count = 0
+    cold_count = 0
+
+    result_table = Table(title=f"Generated DMs — {touch}")
+    result_table.add_column("Contact", style="cyan", max_width=20)
+    result_table.add_column("Company", max_width=18)
+    result_table.add_column("Score", justify="center", width=5)
+    result_table.add_column("Flow", width=10)
+    result_table.add_column("Draft", max_width=60)
+
+    for idx, (record_id, ct) in enumerate(candidates, 1):
+        # Skip if draft already exists for this touch (unless --regenerate)
+        if not regenerate:
+            existing_drafts = [d for d in ct.dm_drafts if d.get("touch") == touch]
+            if existing_drafts:
+                console.print(
+                    f"  [dim][{idx}/{len(candidates)}] {ct.name} — "
+                    f"draft for {touch} already exists (use --regenerate)[/dim]"
+                )
+                continue
+
+        comp = companies_map.get(ct.company_name, Company(
+            company_name=ct.company_name, linkedin_url="", industry="Other",
+        ))
+
+        console.print(
+            f"  [cyan][{idx}/{len(candidates)}][/cyan] {ct.name} "
+            f"({ct.contact_type}, {ct.company_name}) — "
+            f"Score: {ct.lead_score} — {ct.flow_type} — {touch}...",
+            end=" ",
+        )
+
+        try:
+            draft = generator.generate_dm(ct, comp, touch)
+        except Exception as exc:
+            console.print(f"[red]error: {exc}[/red]")
+            continue
+
+        console.print(f"[green]OK[/green] ({len(draft)} chars)")
+
+        # Update dm_drafts and dm_status
+        if regenerate:
+            ct.dm_drafts = [d for d in ct.dm_drafts if d.get("touch") != touch]
+        ct.dm_drafts.append(make_draft_entry(touch, draft))
+        ct.dm_status = f"{touch}_queued"
+
+        # Write to Bitable
+        try:
+            fields = bitable._contact_to_fields(ct)
+            bitable.update_record(bitable.contacts_table_id, record_id, fields)
+        except Exception as exc:
+            console.print(f"    [red]Bitable update failed: {exc}[/red]")
+
+        generated += 1
+        if ct.flow_type == "re_activation":
+            reactivation_count += 1
+        else:
+            cold_count += 1
+
+        # Truncate draft for table display
+        display_draft = draft[:57] + "..." if len(draft) > 60 else draft
+        flow_badge = "[green]re-act[/green]" if ct.flow_type == "re_activation" else "[dim]cold[/dim]"
+        result_table.add_row(
+            ct.name[:20],
+            ct.company_name[:18],
+            str(ct.lead_score),
+            flow_badge,
+            display_draft,
+        )
+
+    # ---- 4. Summary ----
+    console.print()
+    console.print(result_table)
+    console.print(
+        f"\n[bold]Generated {generated} drafts "
+        f"({reactivation_count} re_activation, {cold_count} cold_new)[/bold]"
+    )
+
+
+# ---------------------------------------------------------------------------
 # pipeline scores
 # ---------------------------------------------------------------------------
 
