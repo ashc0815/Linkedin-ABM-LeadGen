@@ -97,6 +97,17 @@ class BitableClient:
         self._token_expires_at: float = 0.0
         self._rate_limiter = RateLimiter(max_calls_per_minute=100)
 
+    @classmethod
+    def from_settings(cls, settings) -> "BitableClient":
+        """Create a BitableClient from a Settings object."""
+        return cls(
+            app_id=settings.feishu_app_id,
+            app_secret=settings.feishu_app_secret,
+            app_token=settings.feishu_bitable_app_token,
+            companies_table_id=settings.feishu_companies_table_id,
+            contacts_table_id=settings.feishu_contacts_table_id,
+        )
+
     # ------------------------------------------------------------------
     # Authentication
     # ------------------------------------------------------------------
@@ -106,6 +117,10 @@ class BitableClient:
         if self._token and time.monotonic() < self._token_expires_at:
             return self._token
         return self._refresh_token()
+
+    def get_tenant_token(self) -> str:
+        """Public accessor: return a valid token (refreshing if needed)."""
+        return self._ensure_token()
 
     def _refresh_token(self) -> str:
         logger.debug("Refreshing tenant_access_token")
