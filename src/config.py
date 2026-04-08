@@ -33,9 +33,21 @@ class Settings(BaseSettings):
             return v.strip()
         return v
 
+    # Fields that are always "configured" (they have non-empty defaults)
+    _NON_SECRET_FIELDS = {"warmup_mode", "warmup_daily_limit", "meeting_pipeline_value"}
+
     def check_status(self) -> dict[str, bool]:
-        """Return a mapping of field name -> whether it is configured (non-empty)."""
-        return {name: bool(getattr(self, name)) for name in Settings.model_fields}
+        """Return a mapping of field name -> whether it is configured (non-empty).
+
+        Non-secret fields with defaults (bools, ints) are always considered configured.
+        """
+        result: dict[str, bool] = {}
+        for name in Settings.model_fields:
+            if name in self._NON_SECRET_FIELDS:
+                result[name] = True
+            else:
+                result[name] = bool(getattr(self, name))
+        return result
 
 
 def load_settings() -> Settings:

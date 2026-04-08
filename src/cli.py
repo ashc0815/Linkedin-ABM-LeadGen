@@ -31,6 +31,9 @@ FIELD_LABELS: dict[str, str] = {
     "unipile_dsn": "Unipile DSN",
     "unipile_account_id": "Unipile Account",
     "brave_search_api_key": "Brave Search API",
+    "warmup_mode": "Warmup Mode",
+    "warmup_daily_limit": "Warmup Daily Limit",
+    "meeting_pipeline_value": "Meeting Pipeline Value",
 }
 
 
