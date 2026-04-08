@@ -1,6 +1,8 @@
 """Typer CLI entry point for linkedin-abm-agent."""
 
+import csv
 import time
+from pathlib import Path
 from typing import Optional
 
 import typer
@@ -274,6 +276,292 @@ def pipeline_scrape_companies(
         f"跳过 {existing_count} 家重复, "
         f"{incomplete_count} 家数据不完整待补[/bold]"
     )
+
+
+# ---------------------------------------------------------------------------
+# pipeline import-existing
+# ---------------------------------------------------------------------------
+
+# Keywords (lowercased) used to filter finance-relevant LinkedIn connections
+_FINANCE_KEYWORDS: list[str] = [
+    "cfo",
+    "chief financial officer",
+    "finance director",
+    "financial controller",
+    "head of finance",
+    "finance manager",
+    "vp finance",
+    "director of finance",
+    "digital transformation",
+    "chief digital officer",
+    "head of digital",
+]
+
+
+def _is_finance_position(position: str) -> bool:
+    lower = position.lower()
+    return any(kw in lower for kw in _FINANCE_KEYWORDS)
+
+
+@pipeline_app.command("import-existing")
+def pipeline_import_existing(
+    file: str = typer.Option(..., "--file", help="Path to LinkedIn Connections.csv export"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview only, do not write to Bitable"),
+) -> None:
+    """Import Tony's existing LinkedIn connections, filtering for finance contacts."""
+    from src.apify_client import _infer_contact_type
+    from src.bitable_client import COMPANY_FIELD_MAP, BitableClient
+    from src.lead_scorer import score_contact as _score_contact
+    from src.models import Company, Contact
+    from src.unipile_client import UnipileClient
+
+    # ---- Validate file ----
+    csv_path = Path(file)
+    if not csv_path.is_file():
+        console.print(f"[red]File not found: {file}[/red]")
+        raise typer.Exit(1)
+
+    settings = load_settings()
+    feishu_ready = all([
+        settings.feishu_app_id,
+        settings.feishu_app_secret,
+        settings.feishu_bitable_app_token,
+        settings.feishu_companies_table_id,
+        settings.feishu_contacts_table_id,
+    ])
+    if not feishu_ready:
+        console.print("[red]Feishu Bitable credentials not fully configured. Aborting.[/red]")
+        raise typer.Exit(1)
+
+    bitable = BitableClient(
+        app_id=settings.feishu_app_id,
+        app_secret=settings.feishu_app_secret,
+        app_token=settings.feishu_bitable_app_token,
+        companies_table_id=settings.feishu_companies_table_id,
+        contacts_table_id=settings.feishu_contacts_table_id,
+    )
+
+    # Unipile (optional)
+    unipile: UnipileClient | None = None
+    unipile_ready = all([settings.unipile_api_key, settings.unipile_dsn, settings.unipile_account_id])
+    if unipile_ready:
+        unipile = UnipileClient(
+            api_key=settings.unipile_api_key,
+            dsn=settings.unipile_dsn,
+            account_id=settings.unipile_account_id,
+        )
+    else:
+        console.print("[yellow]Unipile credentials not set — skipping provider ID enrichment[/yellow]")
+
+    # ---- 1. Read & filter CSV ----
+    console.print(f"[bold]Reading {csv_path.name}...[/bold]")
+    total_rows = 0
+    finance_rows: list[dict] = []
+    skipped_no_url = 0
+
+    with csv_path.open(newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            total_rows += 1
+            # Normalise header names (LinkedIn CSV has spaces: "First Name")
+            first = (row.get("First Name") or row.get("first_name") or "").strip()
+            last = (row.get("Last Name") or row.get("last_name") or "").strip()
+            position = (row.get("Position") or row.get("position") or "").strip()
+            company_name = (row.get("Company") or row.get("company") or "").strip()
+            url = (row.get("URL") or row.get("url") or "").strip()
+
+            if not _is_finance_position(position):
+                continue
+
+            if not url:
+                skipped_no_url += 1
+                continue
+
+            finance_rows.append({
+                "name": f"{first} {last}".strip(),
+                "position": position,
+                "company": company_name,
+                "url": url,
+            })
+
+    console.print(
+        f"  Total connections: {total_rows} | "
+        f"Finance-relevant: {len(finance_rows)} | "
+        f"Skipped (no URL): {skipped_no_url}"
+    )
+
+    if not finance_rows:
+        console.print("[yellow]No finance-relevant contacts found in the CSV.[/yellow]")
+        raise typer.Exit(0)
+
+    # ---- 2. Build company lookup from Bitable ----
+    console.print("[bold]Loading existing companies from Bitable...[/bold]")
+    existing_company_records = bitable.list_records(bitable.companies_table_id)
+    companies_by_name: dict[str, Company] = {}
+    for rec in existing_company_records:
+        try:
+            c = bitable._fields_to_company(rec.get("fields", {}))
+            companies_by_name[c.company_name] = c
+        except Exception:
+            pass
+    console.print(f"  {len(companies_by_name)} companies loaded")
+
+    # ---- 3. Process each finance contact ----
+    type_counts: dict[str, int] = {}
+    new_contacts: list[Contact] = []
+    already_in_system = 0
+    new_companies_added: set[str] = set()
+    provider_resolved = 0
+
+    for idx, row in enumerate(finance_rows, 1):
+        name = row["name"]
+        position = row["position"]
+        company_name = row["company"]
+        linkedin_url = row["url"]
+
+        console.print(
+            f"  [cyan][{idx}/{len(finance_rows)}][/cyan] {name} — {position} @ {company_name}",
+            end="",
+        )
+
+        # 3a. Dedup against Bitable
+        if not dry_run:
+            existing = bitable.find_contact_by_linkedin_url(linkedin_url)
+            if existing:
+                already_in_system += 1
+                console.print(" [dim](exists)[/dim]")
+                continue
+
+        # 3b. Infer contact_type
+        contact_type = _infer_contact_type(position)
+        type_counts[contact_type] = type_counts.get(contact_type, 0) + 1
+
+        # 3c. Build Contact model
+        ct = Contact(
+            name=name,
+            title=position,
+            company_name=company_name,
+            linkedin_url=linkedin_url,
+            contact_type=contact_type,
+            flow_type="re_activation",
+            is_existing_connection=True,
+        )
+
+        # 3d. Unipile enrichment
+        if unipile and not dry_run:
+            try:
+                pid = unipile.resolve_provider_id(linkedin_url)
+                if pid:
+                    ct.linkedin_provider_id = pid
+                    provider_resolved += 1
+
+                    # Confirm connection (should be True for existing connections)
+                    unipile.check_is_connection(pid)
+
+                    # Check for existing chat
+                    chat_id = unipile.get_existing_chat(pid)
+                    if chat_id:
+                        ct.unipile_chat_id = chat_id
+
+                    # Fetch profile summary
+                    try:
+                        profile = unipile.get_profile(pid)
+                        ct.profile_summary = (
+                            profile.get("about")
+                            or profile.get("headline")
+                            or ""
+                        )[:500]
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        # 3e. Match or create company
+        if company_name and company_name not in companies_by_name and not dry_run:
+            new_co = Company(
+                company_name=company_name,
+                linkedin_url="",
+                industry="Other",
+                source="Existing_329",
+            )
+            try:
+                bitable.create_record(
+                    bitable.companies_table_id,
+                    bitable._company_to_fields(new_co),
+                )
+                companies_by_name[company_name] = new_co
+                new_companies_added.add(company_name)
+            except Exception:
+                pass
+
+        # 3f. Score the contact
+        comp = companies_by_name.get(company_name, Company(
+            company_name=company_name, linkedin_url="", industry="Other",
+        ))
+        ct.lead_score = min(_score_contact(ct, comp), 100)
+
+        new_contacts.append(ct)
+        console.print(" [green]✔[/green]")
+
+    # ---- 4. Write contacts to Bitable ----
+    if not dry_run and new_contacts:
+        console.print(f"\n[bold]Writing {len(new_contacts)} contacts to Bitable...[/bold]")
+        fields_list = [bitable._contact_to_fields(ct) for ct in new_contacts]
+        try:
+            bitable.batch_create_records(bitable.contacts_table_id, fields_list)
+            console.print("[green]✔ Batch write complete[/green]")
+        except Exception as exc:
+            console.print(f"[red]✘ Batch write failed: {exc}[/red]")
+    elif dry_run:
+        console.print(f"\n[bold yellow]--dry-run: {len(new_contacts)} contacts would be written[/bold yellow]")
+
+    # ---- 5. Results table ----
+    result_table = Table(title="Import Results")
+    result_table.add_column("姓名", style="cyan", max_width=20)
+    result_table.add_column("职位", max_width=28)
+    result_table.add_column("公司", max_width=22)
+    result_table.add_column("类型", max_width=14)
+    result_table.add_column("Score", justify="center", width=5)
+    result_table.add_column("Provider ID", justify="center", width=11)
+
+    for ct in new_contacts[:50]:  # Show first 50 to avoid huge output
+        pid_badge = "[green]✔[/green]" if ct.linkedin_provider_id else "[dim]—[/dim]"
+        sc = "green" if ct.lead_score >= 50 else "yellow" if ct.lead_score >= 25 else "dim"
+        result_table.add_row(
+            ct.name[:20],
+            ct.title[:28],
+            ct.company_name[:22],
+            ct.contact_type[:14],
+            f"[{sc}]{ct.lead_score}[/{sc}]",
+            pid_badge,
+        )
+
+    if len(new_contacts) > 50:
+        result_table.add_row("...", f"(+{len(new_contacts) - 50} more)", "", "", "", "")
+
+    console.print()
+    console.print(result_table)
+
+    # ---- 6. Summary ----
+    console.print(
+        f"\n[bold]Imported: {len(new_contacts)} finance contacts "
+        f"from {total_rows} total connections[/bold]"
+    )
+
+    # Type breakdown
+    type_parts = []
+    for ctype in ["CFO", "Finance Director", "Financial Controller", "Finance Manager",
+                   "Head of Finance", "Digital Transformation", "Other"]:
+        cnt = type_counts.get(ctype, 0)
+        if cnt > 0:
+            type_parts.append(f"{ctype}: {cnt}")
+    if type_parts:
+        console.print(f"  {', '.join(type_parts)}")
+
+    console.print(f"  New companies added: {len(new_companies_added)}")
+    console.print(f"  Already in system: {already_in_system}")
+    if unipile:
+        console.print(f"  Provider ID resolved: {provider_resolved}/{len(new_contacts)}")
 
 
 # ---------------------------------------------------------------------------
