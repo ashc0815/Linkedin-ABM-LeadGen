@@ -277,6 +277,220 @@ def pipeline_scrape_companies(
 
 
 # ---------------------------------------------------------------------------
+# pipeline scrape-contacts
+# ---------------------------------------------------------------------------
+
+
+@pipeline_app.command("scrape-contacts")
+def pipeline_scrape_contacts(
+    status: str = typer.Option("未触达", help="Filter companies by outreach_status"),
+    limit: int = typer.Option(20, help="Max companies to process"),
+    company: Optional[str] = typer.Option(None, "--company", help="Process a single company by name"),
+    min_score: int = typer.Option(0, "--min-score", help="Only process companies with lead_score >= this"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview only, do not write to Bitable"),
+) -> None:
+    """Scrape LinkedIn contacts for companies, enrich via Unipile, and write to Bitable."""
+    from src.apify_client import ApifyLinkedInClient
+    from src.bitable_client import COMPANY_FIELD_MAP, BitableClient
+    from src.lead_scorer import score_contact as _score_contact
+    from src.models import Company, Contact
+    from src.unipile_client import UnipileClient
+
+    settings = load_settings()
+    if not settings.apify_api_token:
+        console.print("[red]APIFY_API_TOKEN not set. Aborting.[/red]")
+        raise typer.Exit(1)
+
+    feishu_ready = all([
+        settings.feishu_app_id,
+        settings.feishu_app_secret,
+        settings.feishu_bitable_app_token,
+        settings.feishu_companies_table_id,
+        settings.feishu_contacts_table_id,
+    ])
+    if not feishu_ready:
+        console.print("[red]Feishu Bitable credentials not fully configured. Aborting.[/red]")
+        raise typer.Exit(1)
+
+    apify = ApifyLinkedInClient(api_token=settings.apify_api_token)
+    bitable = BitableClient(
+        app_id=settings.feishu_app_id,
+        app_secret=settings.feishu_app_secret,
+        app_token=settings.feishu_bitable_app_token,
+        companies_table_id=settings.feishu_companies_table_id,
+        contacts_table_id=settings.feishu_contacts_table_id,
+    )
+
+    # Build Unipile client (optional — gracefully degrade if not configured)
+    unipile: UnipileClient | None = None
+    unipile_ready = all([settings.unipile_api_key, settings.unipile_dsn, settings.unipile_account_id])
+    if unipile_ready:
+        unipile = UnipileClient(
+            api_key=settings.unipile_api_key,
+            dsn=settings.unipile_dsn,
+            account_id=settings.unipile_account_id,
+        )
+    else:
+        console.print("[yellow]Unipile credentials not set — skipping provider ID / connection enrichment[/yellow]")
+
+    # ---- 1. Fetch target companies from Bitable, sorted by lead_score desc ----
+    if company:
+        col = COMPANY_FIELD_MAP["company_name"]
+        formula = f'CurrentValue.[{col}] = "{company}"'
+    else:
+        col = COMPANY_FIELD_MAP["outreach_status"]
+        formula = f'CurrentValue.[{col}] = "{status}"'
+    raw_records = bitable.list_records(bitable.companies_table_id, filter_formula=formula)
+
+    companies_with_ids: list[tuple[str, Company]] = []
+    for rec in raw_records:
+        try:
+            c = bitable._fields_to_company(rec.get("fields", {}))
+            if c.lead_score >= min_score:
+                companies_with_ids.append((rec["record_id"], c))
+        except Exception:
+            pass
+
+    # Sort by lead_score descending, apply limit
+    companies_with_ids.sort(key=lambda x: x[1].lead_score, reverse=True)
+    companies_with_ids = companies_with_ids[:limit]
+
+    if not companies_with_ids:
+        console.print("[yellow]No companies found matching the filter.[/yellow]")
+        raise typer.Exit(0)
+
+    console.print(
+        f"\n[bold]Processing {len(companies_with_ids)} companies "
+        f"(sorted by lead_score, min_score={min_score})...[/bold]\n"
+    )
+
+    # ---- 2. Per-company loop ----
+    total_new = 0
+    total_existing = 0
+    total_reactivation = 0
+    total_cold = 0
+
+    result_table = Table(title="Contact Scrape Results")
+    result_table.add_column("公司", style="cyan", max_width=24)
+    result_table.add_column("Score", justify="center", width=5)
+    result_table.add_column("Found", justify="center", width=5)
+    result_table.add_column("New", justify="center", width=5)
+    result_table.add_column("Existing", justify="center", width=8)
+    result_table.add_column("Re-act", justify="center", width=6)
+    result_table.add_column("Cold", justify="center", width=5)
+
+    for co_idx, (_co_rec_id, comp) in enumerate(companies_with_ids, 1):
+        console.print(
+            f"[cyan][{co_idx}/{len(companies_with_ids)}][/cyan] "
+            f"Processing {comp.company_name} (score={comp.lead_score})...",
+            end=" ",
+        )
+
+        # 2a. Scrape contacts via Apify
+        try:
+            scraped = apify.scrape_contacts_for_company(comp.company_name, comp.linkedin_url)
+        except Exception as exc:
+            console.print(f"[red]Apify error: {exc}[/red]")
+            scraped = []
+
+        # 2b. Deduplicate against Bitable
+        new_contacts: list[Contact] = []
+        existing_in_bitable = 0
+        for ct in scraped:
+            found = bitable.find_contact_by_linkedin_url(ct.linkedin_url) if not dry_run else None
+            if found:
+                existing_in_bitable += 1
+            else:
+                new_contacts.append(ct)
+
+        # 2c. Enrich each new contact via Unipile
+        co_reactivation = 0
+        co_cold = 0
+        for ct in new_contacts:
+            if unipile and not dry_run:
+                try:
+                    pid = unipile.resolve_provider_id(ct.linkedin_url)
+                    if pid:
+                        ct.linkedin_provider_id = pid
+
+                        # Check connection status
+                        if unipile.check_is_connection(pid):
+                            ct.is_existing_connection = True
+                            ct.flow_type = "re_activation"
+
+                        # Supplement profile_summary if empty
+                        if not ct.profile_summary:
+                            try:
+                                profile = unipile.get_profile(pid)
+                                ct.profile_summary = (
+                                    profile.get("about")
+                                    or profile.get("headline")
+                                    or ""
+                                )[:500]
+                            except Exception:
+                                pass
+
+                        # Check for existing chat
+                        chat_id = unipile.get_existing_chat(pid)
+                        if chat_id:
+                            ct.unipile_chat_id = chat_id
+                except Exception as exc:
+                    logger_msg = f"Unipile enrichment failed for {ct.name}: {exc}"
+                    logger_msg  # logged below if needed
+                    pass  # Graceful degradation
+
+            # Score the contact
+            ct.lead_score = min(_score_contact(ct, comp), 100)
+
+            if ct.flow_type == "re_activation":
+                co_reactivation += 1
+            else:
+                co_cold += 1
+
+        console.print(
+            f"found {len(scraped)} contacts "
+            f"({len(new_contacts)} new, {existing_in_bitable} existing)"
+        )
+
+        # 2d. Write to Bitable
+        if not dry_run and new_contacts:
+            fields_list = [bitable._contact_to_fields(ct) for ct in new_contacts]
+            try:
+                bitable.batch_create_records(bitable.contacts_table_id, fields_list)
+            except Exception as exc:
+                console.print(f"  [red]✘ Batch write failed: {exc}[/red]")
+
+        # Track totals
+        total_new += len(new_contacts)
+        total_existing += existing_in_bitable
+        total_reactivation += co_reactivation
+        total_cold += co_cold
+
+        result_table.add_row(
+            comp.company_name[:24],
+            str(comp.lead_score),
+            str(len(scraped)),
+            str(len(new_contacts)),
+            str(existing_in_bitable),
+            str(co_reactivation) if co_reactivation else "-",
+            str(co_cold) if co_cold else "-",
+        )
+
+    # ---- 3. Summary ----
+    console.print()
+    console.print(result_table)
+
+    if dry_run:
+        console.print("\n[bold yellow]--dry-run: no records written to Bitable[/bold yellow]")
+
+    console.print(
+        f"\n[bold]Total: {total_new} new contacts "
+        f"({total_reactivation} re_activation, {total_cold} cold_new), "
+        f"{total_existing} skipped duplicates[/bold]"
+    )
+
+
+# ---------------------------------------------------------------------------
 # pipeline enrich
 # ---------------------------------------------------------------------------
 
