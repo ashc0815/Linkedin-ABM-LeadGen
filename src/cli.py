@@ -281,26 +281,6 @@ def pipeline_scrape_companies(
 # ---------------------------------------------------------------------------
 
 
-def _enrichment_score(company: "Company") -> int:
-    """Simple 0-100 enrichment quality score."""
-    score = 0
-    if company.sap_user == "Yes":
-        score += 25
-    if company.uses_concur == "Yes":
-        score += 25
-    if company.enrichment_signals.get("recent_news"):
-        score += 15
-    if company.has_overseas_offices:
-        score += 10
-    if company.enrichment_signals.get("tech_stack_clues"):
-        score += 10
-    if company.enrichment_signals.get("website_signals"):
-        score += 10
-    if company.enrichment_signals.get("abn"):
-        score += 5
-    return min(score, 100)
-
-
 @pipeline_app.command("enrich")
 def pipeline_enrich(
     status: str = typer.Option("未触达", help="Filter companies by outreach_status"),
@@ -379,7 +359,9 @@ def pipeline_enrich(
         f"(~{len(candidates) * 5} Brave API calls, ~{len(candidates) * 5}s)...[/bold]\n"
     )
 
-    # ---- 3. Enrich each company ----
+    # ---- 3. Enrich + score each company ----
+    from src.lead_scorer import score_company as _score_company
+
     enriched: list[tuple[str, Company]] = []
     sap_count = 0
     concur_count = 0
@@ -390,10 +372,11 @@ def pipeline_enrich(
             end=" ",
         )
         comp = enricher.enrich_company(comp)
+        comp.lead_score = _score_company(comp)
         enriched.append((record_id, comp))
 
         summary = enrichment_summary(comp)
-        console.print(f"[green]✅[/green] {summary}")
+        console.print(f"[green]✅[/green] {summary}  [dim](score={comp.lead_score})[/dim]")
 
         if comp.sap_user == "Yes":
             sap_count += 1
@@ -418,16 +401,15 @@ def pipeline_enrich(
     result_table.add_column("Concur?", justify="center")
     result_table.add_column("新闻数", justify="center")
     result_table.add_column("海外办公室?", justify="center")
-    result_table.add_column("评分", justify="center")
+    result_table.add_column("Lead Score", justify="center")
 
     for _, comp in enriched:
         news_count = len(comp.enrichment_signals.get("recent_news", []))
-        score = _enrichment_score(comp)
 
         sap_badge = "[green]Yes[/green]" if comp.sap_user == "Yes" else "[dim]No[/dim]"
         concur_badge = "[green]Yes[/green]" if comp.uses_concur == "Yes" else "[dim]No[/dim]"
         overseas_badge = "[green]Yes[/green]" if comp.has_overseas_offices else "[dim]No[/dim]"
-        score_color = "green" if score >= 50 else "yellow" if score >= 25 else "dim"
+        score_color = "green" if comp.lead_score >= 50 else "yellow" if comp.lead_score >= 25 else "dim"
 
         result_table.add_row(
             comp.company_name[:30],
@@ -435,7 +417,7 @@ def pipeline_enrich(
             concur_badge,
             str(news_count) if news_count else "-",
             overseas_badge,
-            f"[{score_color}]{score}[/{score_color}]",
+            f"[{score_color}]{comp.lead_score}[/{score_color}]",
         )
 
     console.print()
@@ -446,6 +428,161 @@ def pipeline_enrich(
         f"\n[bold]Enriched {update_ok}/{len(enriched)} companies, "
         f"{sap_count} confirmed SAP users, "
         f"{concur_count} confirmed Concur users[/bold]"
+    )
+
+
+# ---------------------------------------------------------------------------
+# pipeline scores
+# ---------------------------------------------------------------------------
+
+
+@pipeline_app.command("scores")
+def pipeline_scores(
+    top_companies: int = typer.Option(20, help="Number of top companies to show"),
+    top_contacts: int = typer.Option(30, help="Number of top contacts to show"),
+) -> None:
+    """Display lead score leaderboard for companies and contacts."""
+    from src.bitable_client import BitableClient
+    from src.lead_scorer import (
+        batch_score_companies,
+        batch_score_contacts,
+        get_company_breakdown,
+        get_contact_breakdown,
+        score_company as _score_company,
+    )
+    from src.models import Company, Contact
+
+    settings = load_settings()
+    feishu_ready = all([
+        settings.feishu_app_id,
+        settings.feishu_app_secret,
+        settings.feishu_bitable_app_token,
+        settings.feishu_companies_table_id,
+    ])
+    if not feishu_ready:
+        console.print("[red]Feishu Bitable credentials not fully configured. Aborting.[/red]")
+        raise typer.Exit(1)
+
+    bitable = BitableClient(
+        app_id=settings.feishu_app_id,
+        app_secret=settings.feishu_app_secret,
+        app_token=settings.feishu_bitable_app_token,
+        companies_table_id=settings.feishu_companies_table_id,
+        contacts_table_id=settings.feishu_contacts_table_id,
+    )
+
+    # ---- Fetch all companies ----
+    console.print("[bold]Loading companies...[/bold]")
+    raw_companies = bitable.list_records(bitable.companies_table_id)
+    companies: list[Company] = []
+    for rec in raw_companies:
+        try:
+            companies.append(bitable._fields_to_company(rec.get("fields", {})))
+        except Exception:
+            pass
+
+    if not companies:
+        console.print("[yellow]No companies found in Bitable.[/yellow]")
+        raise typer.Exit(0)
+
+    scored_companies = batch_score_companies(companies)
+
+    # ---- Companies table ----
+    co_table = Table(title=f"Top {top_companies} Companies by Lead Score")
+    co_table.add_column("#", style="dim", width=3)
+    co_table.add_column("公司名", style="cyan", max_width=28)
+    co_table.add_column("行业", max_width=18)
+    co_table.add_column("员工", justify="right", width=6)
+    co_table.add_column("SAP", justify="center", width=5)
+    co_table.add_column("Concur", justify="center", width=7)
+    co_table.add_column("Score", justify="center", width=5)
+    co_table.add_column("Breakdown", style="dim", max_width=50)
+
+    for rank, (comp, score) in enumerate(scored_companies[:top_companies], 1):
+        breakdown = get_company_breakdown(comp)
+        bd_str = "; ".join(f"{k} +{v}" for k, v in breakdown.items()) if breakdown else "-"
+        sap = "[green]Y[/green]" if comp.sap_user == "Yes" else "[dim]?[/dim]" if comp.sap_user == "Unknown" else "N"
+        concur = "[green]Y[/green]" if comp.uses_concur == "Yes" else "[dim]?[/dim]" if comp.uses_concur == "Unknown" else "N"
+        sc = "green" if score >= 50 else "yellow" if score >= 25 else "dim"
+
+        co_table.add_row(
+            str(rank),
+            comp.company_name[:28],
+            comp.industry,
+            str(comp.employee_count),
+            sap, concur,
+            f"[{sc}]{score}[/{sc}]",
+            bd_str,
+        )
+
+    console.print()
+    console.print(co_table)
+
+    # ---- Fetch all contacts ----
+    console.print("\n[bold]Loading contacts...[/bold]")
+    raw_contacts = bitable.list_records(bitable.contacts_table_id)
+    contacts: list[Contact] = []
+    for rec in raw_contacts:
+        try:
+            contacts.append(bitable._fields_to_contact(rec.get("fields", {})))
+        except Exception:
+            pass
+
+    if not contacts:
+        console.print("[yellow]No contacts found in Bitable.[/yellow]")
+        return
+
+    # Build company lookup
+    companies_map: dict[str, Company] = {c.company_name: c for c in companies}
+    scored_contacts = batch_score_contacts(contacts, companies_map)
+
+    # ---- Contacts table ----
+    ct_table = Table(title=f"Top {top_contacts} Contacts by Lead Score")
+    ct_table.add_column("#", style="dim", width=3)
+    ct_table.add_column("姓名", style="cyan", max_width=18)
+    ct_table.add_column("职位", max_width=22)
+    ct_table.add_column("公司", max_width=20)
+    ct_table.add_column("类型", max_width=12)
+    ct_table.add_column("Flow", width=10)
+    ct_table.add_column("Score", justify="center", width=5)
+    ct_table.add_column("Breakdown", style="dim", max_width=50)
+
+    for rank, (ct, score) in enumerate(scored_contacts[:top_contacts], 1):
+        comp = companies_map.get(ct.company_name, Company(
+            company_name=ct.company_name, linkedin_url="", industry="Other",
+        ))
+        breakdown = get_contact_breakdown(ct, comp)
+        bd_str = "; ".join(f"{k} +{v}" for k, v in breakdown.items()) if breakdown else "-"
+        flow_badge = "[green]reactivate[/green]" if ct.flow_type == "re_activation" else "[dim]cold[/dim]"
+        sc = "green" if score >= 50 else "yellow" if score >= 25 else "dim"
+
+        ct_table.add_row(
+            str(rank),
+            ct.name[:18],
+            ct.title[:22],
+            ct.company_name[:20],
+            ct.contact_type[:12],
+            flow_badge,
+            f"[{sc}]{score}[/{sc}]",
+            bd_str,
+        )
+
+    console.print()
+    console.print(ct_table)
+
+    # ---- Summary stats ----
+    avg_co = sum(s for _, s in scored_companies) // len(scored_companies) if scored_companies else 0
+    avg_ct = sum(s for _, s in scored_contacts) // len(scored_contacts) if scored_contacts else 0
+    high_co = sum(1 for _, s in scored_companies if s >= 50)
+    high_ct = sum(1 for _, s in scored_contacts if s >= 50)
+
+    console.print(
+        f"\n[bold]Companies:[/bold] {len(companies)} total, "
+        f"avg score {avg_co}, {high_co} high-value (≥50)"
+    )
+    console.print(
+        f"[bold]Contacts:[/bold] {len(contacts)} total, "
+        f"avg score {avg_ct}, {high_ct} high-value (≥50)"
     )
 
 
