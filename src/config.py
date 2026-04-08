@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     warmup_mode: bool = False
     warmup_daily_limit: int = 10
 
+    # Pipeline value estimation (AUD per meeting booked)
+    meeting_pipeline_value: int = 50000
+
     @field_validator("*", mode="before")
     @classmethod
     def strip_whitespace(cls, v: object) -> object:

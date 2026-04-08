@@ -1736,6 +1736,359 @@ def pipeline_check_acceptances(
 
 
 # ---------------------------------------------------------------------------
+# pipeline daily
+# ---------------------------------------------------------------------------
+
+
+def _load_all_contacts_and_companies(settings):
+    """Shared helper to fetch all contacts and companies from Bitable."""
+    from src.bitable_client import BitableClient
+    from src.models import Company, Contact
+
+    bitable = BitableClient(
+        app_id=settings.feishu_app_id,
+        app_secret=settings.feishu_app_secret,
+        app_token=settings.feishu_bitable_app_token,
+        companies_table_id=settings.feishu_companies_table_id,
+        contacts_table_id=settings.feishu_contacts_table_id,
+    )
+
+    raw_co = bitable.list_records(bitable.companies_table_id)
+    companies: list[Company] = []
+    for rec in raw_co:
+        try:
+            companies.append(bitable._fields_to_company(rec.get("fields", {})))
+        except Exception:
+            pass
+
+    raw_ct = bitable.list_records(bitable.contacts_table_id)
+    contacts: list[Contact] = []
+    for rec in raw_ct:
+        try:
+            contacts.append(bitable._fields_to_contact(rec.get("fields", {})))
+        except Exception:
+            pass
+
+    return contacts, companies
+
+
+@pipeline_app.command("daily")
+def pipeline_daily(
+    week: bool = typer.Option(False, "--week", help="Show 7-day forward plan"),
+) -> None:
+    """Display daily pipeline dashboard with actions and workflow."""
+    from rich.panel import Panel
+
+    from src.daily_actions import generate_daily_report, generate_weekly_plan
+
+    settings = load_settings()
+    feishu_ready = all([
+        settings.feishu_app_id,
+        settings.feishu_app_secret,
+        settings.feishu_bitable_app_token,
+        settings.feishu_companies_table_id,
+        settings.feishu_contacts_table_id,
+    ])
+    if not feishu_ready:
+        console.print("[red]Feishu Bitable credentials not fully configured. Aborting.[/red]")
+        raise typer.Exit(1)
+
+    contacts, companies = _load_all_contacts_and_companies(settings)
+
+    report = generate_daily_report(contacts, companies)
+    today = report["date"]
+
+    # ---- Header ----
+    console.print(Panel(
+        f"[bold]DAILY PIPELINE DASHBOARD — {today.isoformat()}[/bold]",
+        style="bold cyan",
+    ))
+
+    # ---- Top priority contacts (score >= 70) ----
+    top_priority = [ct for ct in report["due_today"] if ct.lead_score >= 70]
+    if top_priority:
+        console.print("\n[bold red]TOP PRIORITY (Score >= 70):[/bold red]")
+        for ct in top_priority[:5]:
+            console.print(
+                f"  {ct.name} ({ct.contact_type}, {ct.company_name}) — "
+                f"Score: {ct.lead_score} — {ct.flow_type} — {ct.dm_status}"
+            )
+
+    # ---- Re-activation flow ----
+    re_contacts = [ct for ct in contacts if ct.flow_type == "re_activation"]
+    re_day1 = [ct for ct in re_contacts if ct.dm_status in ("not_started", "day1_queued")]
+    re_day7 = [ct for ct in re_contacts if ct.dm_status in ("day1_sent", "day7_queued")]
+    re_day14 = [ct for ct in re_contacts if ct.dm_status in ("day7_sent", "day14_queued")]
+    re_day21 = [ct for ct in re_contacts if ct.dm_status in ("day14_sent", "day21_queued")]
+
+    console.print("\n[bold green]RE-ACTIVATION FLOW:[/bold green]")
+    console.print(f"  Day 1 — Re-engage ({len(re_day1)} contacts)")
+    console.print(f"  Day 7 — Follow-up ({len(re_day7)} contacts)")
+    console.print(f"  Day 14 — Value offer ({len(re_day14)} contacts)")
+    console.print(f"  Day 21 — Direct ask ({len(re_day21)} contacts)")
+
+    # ---- Cold new flow ----
+    cold_contacts = [ct for ct in contacts if ct.flow_type == "cold_new"]
+    cold_day1 = [ct for ct in cold_contacts if ct.dm_status in ("not_started", "day1_queued")]
+    cold_pending = report["pending_acceptances"]
+    cold_day7 = [ct for ct in cold_contacts if ct.dm_status in ("day7_queued",)]
+    cold_day14 = [ct for ct in cold_contacts if ct.dm_status in ("day7_sent", "day14_queued")]
+    cold_day21 = [ct for ct in cold_contacts if ct.dm_status in ("day14_sent", "day21_queued")]
+
+    avg_pending_days = 0
+    if cold_pending:
+        days_list = []
+        for ct in cold_pending:
+            if ct.last_touch_date:
+                days_list.append((today - ct.last_touch_date.date()).days)
+        avg_pending_days = sum(days_list) // len(days_list) if days_list else 0
+
+    console.print("\n[bold blue]COLD NEW FLOW:[/bold blue]")
+    console.print(f"  Day 1 — Connection request ({len(cold_day1)} contacts)")
+    console.print(f"  Awaiting acceptance ({len(cold_pending)} contacts, avg {avg_pending_days} days)")
+    console.print(f"  Day 7 — Follow-up ({len(cold_day7)} contacts, accepted)")
+    console.print(f"  Day 14 — Value offer ({len(cold_day14)} contacts)")
+    console.print(f"  Day 21 — Direct ask ({len(cold_day21)} contacts)")
+
+    # ---- Suggested workflow ----
+    if report["steps"]:
+        console.print("\n[bold]SUGGESTED DAILY WORKFLOW:[/bold]")
+        for i, step in enumerate(report["steps"], 1):
+            console.print(f"  {i}. [cyan]{step['command']}[/cyan]")
+            console.print(f"     {step['description']}")
+
+    # ---- Pipeline health ----
+    enriched = sum(1 for co in companies if co.enrichment_signals)
+    enrich_pct = (enriched / len(companies) * 100) if companies else 0
+    re_total = len(re_contacts)
+    cold_total = len(cold_contacts)
+
+    console.print("\n[bold]PIPELINE HEALTH:[/bold]")
+    console.print(
+        f"  Companies: {len(companies)} | Enriched: {enriched} ({enrich_pct:.0f}%) | "
+        f"Avg score: {sum(co.lead_score for co in companies) // len(companies) if companies else 0}"
+    )
+    console.print(
+        f"  Contacts: {len(contacts)} | Re-activation: {re_total} | Cold new: {cold_total}"
+    )
+    console.print(f"  Today's queue: {len(report['queued'])} DMs ready")
+
+    # Recent activity
+    replied = report["replied"]
+    meetings = report["meetings"]
+    if replied or meetings:
+        console.print(
+            f"  Recent: {len(replied)} replies, {len(meetings)} meetings booked"
+        )
+
+    # ---- Weekly plan ----
+    if week:
+        plan = generate_weekly_plan(contacts)
+        console.print()
+        week_table = Table(title="7-Day Forward Plan")
+        week_table.add_column("Date", style="cyan", width=12)
+        week_table.add_column("Day", width=5)
+        week_table.add_column("Due", justify="center", width=5)
+        week_table.add_column("Breakdown", max_width=40)
+
+        for day_plan in plan:
+            breakdown = ", ".join(
+                f"{t}: {n}" for t, n in sorted(day_plan["by_touch"].items())
+            ) if day_plan["by_touch"] else "—"
+            is_today = day_plan["date"] == today
+            date_str = day_plan["date"].isoformat()
+            if is_today:
+                date_str = f"[bold]{date_str}[/bold]"
+            week_table.add_row(
+                date_str,
+                day_plan["weekday"],
+                str(day_plan["count"]),
+                breakdown,
+            )
+
+        console.print(week_table)
+
+
+# ---------------------------------------------------------------------------
+# pipeline stats
+# ---------------------------------------------------------------------------
+
+
+@pipeline_app.command("stats")
+def pipeline_stats(
+    period: str = typer.Option("all", help="Period: week, month, or all"),
+) -> None:
+    """Display detailed pipeline statistics and funnel metrics."""
+    from datetime import date, timedelta
+
+    from src.daily_actions import generate_pipeline_stats
+
+    settings = load_settings()
+    feishu_ready = all([
+        settings.feishu_app_id,
+        settings.feishu_app_secret,
+        settings.feishu_bitable_app_token,
+        settings.feishu_companies_table_id,
+        settings.feishu_contacts_table_id,
+    ])
+    if not feishu_ready:
+        console.print("[red]Feishu Bitable credentials not fully configured. Aborting.[/red]")
+        raise typer.Exit(1)
+
+    contacts, companies = _load_all_contacts_and_companies(settings)
+
+    # Period filter for contacts (by last_touch_date)
+    if period != "all":
+        today = date.today()
+        if period == "week":
+            cutoff = today - timedelta(days=7)
+        elif period == "month":
+            cutoff = today - timedelta(days=30)
+        else:
+            cutoff = None
+
+        if cutoff:
+            contacts = [
+                ct for ct in contacts
+                if ct.last_touch_date and ct.last_touch_date.date() >= cutoff
+            ]
+
+    if not contacts and not companies:
+        console.print("[yellow]No data found.[/yellow]")
+        raise typer.Exit(0)
+
+    stats = generate_pipeline_stats(contacts, companies)
+
+    # ---- Funnel ----
+    console.print("\n[bold]PIPELINE FUNNEL:[/bold]")
+    funnel_table = Table(show_header=False, box=None, padding=(0, 2))
+    funnel_table.add_column("Stage", style="cyan", min_width=24)
+    funnel_table.add_column("Count", justify="right", width=6)
+    funnel_table.add_column("Bar", min_width=30)
+
+    max_val = max(stats["total_companies"], stats["total_contacts"], 1)
+    funnel_data = [
+        ("Companies scraped", stats["total_companies"]),
+        ("Companies enriched", stats["enriched_companies"]),
+        ("SAP confirmed", stats["sap_confirmed"]),
+        ("Concur confirmed", stats["concur_confirmed"]),
+        ("Contacts found", stats["total_contacts"]),
+        ("Contacts touched", stats["touched"]),
+        ("Replied", stats["replied"]),
+        ("Meetings booked", stats["meetings"]),
+        ("Rejected", stats["rejected"]),
+    ]
+    for label, val in funnel_data:
+        bar_len = int(val / max_val * 25) if max_val else 0
+        bar = "[green]" + "█" * bar_len + "[/green]" + "░" * (25 - bar_len)
+        funnel_table.add_row(label, str(val), bar)
+
+    console.print(funnel_table)
+
+    # ---- Conversion rates ----
+    console.print(f"\n[bold]CONVERSION RATES:[/bold]")
+    console.print(f"  Reply rate: {stats['reply_rate']:.1f}%")
+    console.print(f"  Meeting rate: {stats['meeting_rate']:.1f}%")
+    if stats["touched"]:
+        avg_touches = sum(ct.touch_count for ct in contacts if ct.dm_status == "replied")
+        replied_count = stats["replied"]
+        avg_touch_per_reply = avg_touches / replied_count if replied_count else 0
+        console.print(f"  Avg touches before reply: {avg_touch_per_reply:.1f}")
+
+    # ---- Status distribution ----
+    console.print(f"\n[bold]DM STATUS DISTRIBUTION:[/bold]")
+    status_table = Table(show_header=True, box=None, padding=(0, 2))
+    status_table.add_column("Status", style="cyan", min_width=18)
+    status_table.add_column("Count", justify="right", width=6)
+
+    for status, count in sorted(stats["status_dist"].items(), key=lambda x: -x[1]):
+        status_table.add_row(status, str(count))
+    console.print(status_table)
+
+    # ---- By flow_type ----
+    console.print(f"\n[bold]BY FLOW TYPE:[/bold]")
+    for flow, count in sorted(stats["flow_dist"].items()):
+        replied_in_flow = sum(
+            1 for ct in contacts
+            if ct.flow_type == flow and ct.dm_status == "replied"
+        )
+        touched_in_flow = sum(
+            1 for ct in contacts
+            if ct.flow_type == flow and ct.touch_count > 0
+        )
+        rate = (replied_in_flow / touched_in_flow * 100) if touched_in_flow else 0
+        console.print(
+            f"  {flow}: {count} contacts, {replied_in_flow} replied ({rate:.1f}% reply rate)"
+        )
+
+    # ---- By contact_type ----
+    console.print(f"\n[bold]BY CONTACT TYPE:[/bold]")
+    type_table = Table(show_header=True, box=None, padding=(0, 2))
+    type_table.add_column("Type", style="cyan", min_width=22)
+    type_table.add_column("Count", justify="right", width=6)
+    type_table.add_column("Replied", justify="right", width=7)
+    type_table.add_column("Rate", justify="right", width=6)
+
+    for ctype, count in sorted(stats["type_dist"].items(), key=lambda x: -x[1]):
+        replied_ct = sum(
+            1 for ct in contacts
+            if ct.contact_type == ctype and ct.dm_status == "replied"
+        )
+        touched_ct = sum(
+            1 for ct in contacts
+            if ct.contact_type == ctype and ct.touch_count > 0
+        )
+        rate = (replied_ct / touched_ct * 100) if touched_ct else 0
+        type_table.add_row(ctype, str(count), str(replied_ct), f"{rate:.0f}%")
+    console.print(type_table)
+
+    # ---- By industry ----
+    console.print(f"\n[bold]BY INDUSTRY:[/bold]")
+    ind_table = Table(show_header=True, box=None, padding=(0, 2))
+    ind_table.add_column("Industry", style="cyan", min_width=22)
+    ind_table.add_column("Companies", justify="right", width=9)
+    ind_table.add_column("Avg Score", justify="right", width=9)
+
+    for ind, count in sorted(stats["industry_dist"].items(), key=lambda x: -x[1]):
+        ind_companies = [co for co in companies if co.industry == ind]
+        avg = sum(co.lead_score for co in ind_companies) // len(ind_companies) if ind_companies else 0
+        ind_table.add_row(ind, str(count), str(avg))
+    console.print(ind_table)
+
+    # ---- Lead score distribution ----
+    console.print(f"\n[bold]LEAD SCORE DISTRIBUTION:[/bold]")
+    score_table = Table(show_header=True, box=None, padding=(0, 2))
+    score_table.add_column("Range", style="cyan", width=10)
+    score_table.add_column("Companies", justify="right", width=9)
+    score_table.add_column("Contacts", justify="right", width=8)
+    score_table.add_column("Bar", min_width=20)
+
+    ranges = [(0, 19), (20, 39), (40, 59), (60, 79), (80, 100)]
+    max_bucket = 1
+    buckets = []
+    for lo, hi in ranges:
+        co_n = sum(1 for co in companies if lo <= co.lead_score <= hi)
+        ct_n = sum(1 for ct in contacts if lo <= ct.lead_score <= hi)
+        buckets.append((lo, hi, co_n, ct_n))
+        max_bucket = max(max_bucket, co_n, ct_n)
+
+    for lo, hi, co_n, ct_n in buckets:
+        bar_len = int(max(co_n, ct_n) / max_bucket * 15)
+        bar = "█" * bar_len + "░" * (15 - bar_len)
+        score_table.add_row(f"{lo}-{hi}", str(co_n), str(ct_n), bar)
+    console.print(score_table)
+
+    # ---- Pipeline value ----
+    meeting_value = settings.meeting_pipeline_value
+    total_value = stats["meetings"] * meeting_value
+    console.print(f"\n[bold]PIPELINE VALUE:[/bold]")
+    console.print(
+        f"  Estimated pipeline: AUD {total_value:,} "
+        f"({stats['meetings']} meetings x AUD {meeting_value:,})"
+    )
+
+
+# ---------------------------------------------------------------------------
 # pipeline scores
 # ---------------------------------------------------------------------------
 
