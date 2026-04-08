@@ -1,140 +1,83 @@
+# Pipeline Flow
+
+## Daily Workflow
+
+```mermaid
+flowchart LR
+    A[check-acceptances] --> B[daily]
+    B --> C[generate-dms]
+    C --> D[warm]
+    D -->|wait 2-4h| E[push-dms]
+    E --> F[mark replied/meeting]
+    F --> G[stats]
+```
+
+## Main Pipeline
+
 ```mermaid
 flowchart TD
-    subgraph DISCOVERY["1. DISCOVERY"]
-        SC["pipeline scrape-companies<br/>Apify LinkedIn Search<br/>→ Companies → Bitable"]
-        IE["pipeline import-existing<br/>Connections.csv → filter<br/>finance titles → Bitable"]
+    subgraph Discovery
+        scrape-companies -->|"Apify"| Companies[(Companies)]
+        import-existing -->|"CSV"| Contacts[(Contacts)]
     end
 
-    subgraph ENRICHMENT["2. ENRICHMENT & SCORING"]
-        EN["pipeline enrich<br/>Brave Search: job posts,<br/>tech stack, news, website,<br/>ABN verification"]
-        SCT["pipeline scrape-contacts<br/>Apify People Search<br/>+ Unipile resolve"]
-        LS["Lead Scorer<br/>Company: 0-100<br/>Contact: 50% company + own"]
+    subgraph Enrichment
+        Companies --> enrich -->|"Brave Search"| Companies
+        Companies --> scrape-contacts -->|"Apify + Unipile"| Contacts
+        enrich --> lead-scorer
+        scrape-contacts --> lead-scorer
     end
 
-    subgraph DM_GEN["3. DM GENERATION"]
-        GD["pipeline generate-dms<br/>Claude API → personalised<br/>DM per touch + flow"]
-        QV["Quality Validation<br/>blacklist, length,<br/>template vars"]
+    subgraph Outreach
+        lead-scorer --> generate-dms -->|"Claude"| Drafts[DM Drafts]
+        Drafts --> warm -->|"view + like"| push-dms
+        push-dms -->|"cold day1"| send_connection_request
+        push-dms -->|"all others"| send_message
     end
 
-    subgraph OUTREACH["4. OUTREACH"]
-        WM["pipeline warm<br/>view_profile + like_post<br/>5-10s random delays"]
-        WAIT["Wait 2-4 hours<br/>let notification land"]
-        PD["pipeline push-dms<br/>20-40s between sends<br/>daily limit: 80 (10 warmup)"]
+    subgraph Monitoring
+        push-dms --> check-acceptances
+        check-acceptances -->|accepted| generate-dms
+        check-acceptances -->|timeout 14d| withdrawn[Withdrawn → retry 30d]
+        push-dms --> mark
+        mark -->|replied| replied((replied))
+        mark -->|meeting| meeting((meeting))
     end
+```
 
-    subgraph SEND_LOGIC["Send Routing"]
-        CR["send_connection_request<br/>cold_new + day1"]
-        SM["send_message<br/>re_activation + any<br/>cold_new + day7/14/21"]
-    end
+## Contact Status Machine
 
-    subgraph MONITORING["5. MONITORING"]
-        CA["pipeline check-acceptances<br/>daily: accepted? replied?<br/>withdrawn after 14d?"]
-        MK["pipeline mark<br/>sent / replied /<br/>rejected / meeting"]
-    end
+```mermaid
+stateDiagram-v2
+    [*] --> not_started
+    not_started --> day1_queued: generate-dms
+    day1_queued --> day1_sent: push-dms
 
-    subgraph REPORTING["6. REPORTING"]
-        DL["pipeline daily<br/>dashboard + workflow"]
-        ST["pipeline stats<br/>funnel + conversion"]
-        SCO["pipeline scores<br/>leaderboard"]
-    end
+    state cold_new_fork <<choice>>
+    day1_sent --> cold_new_fork
+    cold_new_fork --> day7_queued: accepted
+    cold_new_fork --> not_started: withdrawn (14d)
 
-    subgraph STATUS_FLOW["Contact DM Status Machine"]
-        direction LR
-        NS["not_started"]
-        D1Q["day1_queued"]
-        D1S["day1_sent"]
-        D7Q["day7_queued"]
-        D7S["day7_sent"]
-        D14Q["day14_queued"]
-        D14S["day14_sent"]
-        D21Q["day21_queued"]
-        D21S["day21_sent"]
-        REP["replied"]
-        REJ["rejected"]
-        MTG["meeting_booked"]
+    day1_sent --> day7_queued: re_activation (immediate)
 
-        NS --> D1Q --> D1S
-        D1S -->|"accepted<br/>(cold_new)"| D7Q
-        D1S -->|"re_activation"| D7Q
-        D7Q --> D7S --> D14Q --> D14S --> D21Q --> D21S
-        D1S --> REP
-        D7S --> REP
-        D14S --> REP
-        D21S --> REP
-        REP --> MTG
-        D1S --> REJ
-        D7S --> REJ
-        D14S --> REJ
-        D21S --> REJ
-        D1S -->|"withdrawn<br/>after 14d"| NS
-    end
+    day7_queued --> day7_sent: push-dms
+    day7_sent --> day14_queued: +7 days
+    day14_queued --> day14_sent: push-dms
+    day14_sent --> day21_queued: +7 days
+    day21_queued --> day21_sent: push-dms
 
-    subgraph INFRA["Infrastructure"]
-        BT["Feishu Bitable<br/>Companies + Contacts"]
-        AP["Apify<br/>LinkedIn Scraping"]
-        UP["Unipile<br/>LinkedIn Messaging"]
-        CL["Anthropic Claude<br/>DM Generation"]
-        BR["Brave Search<br/>Enrichment"]
-        RL["Rate Limiter<br/>per-sec / per-min / per-day"]
-    end
+    day1_sent --> replied
+    day7_sent --> replied
+    day14_sent --> replied
+    day21_sent --> replied
 
-    %% Main flow connections
-    SC --> EN
-    IE --> SCT
-    EN --> LS
-    SCT --> LS
-    LS --> GD
-    GD --> QV
-    QV -->|"pass"| WM
-    QV -->|"fail: retry<br/>max 2x"| GD
-    WM --> WAIT --> PD
-    PD --> CR
-    PD --> SM
+    day1_sent --> rejected
+    day7_sent --> rejected
+    day14_sent --> rejected
+    day21_sent --> rejected
 
-    %% Post-send
-    CR --> CA
-    SM --> CA
-    CA -->|"accepted"| D7Q
-    CA -->|"replied"| REP
-    CA -->|"timeout"| NS
-
-    %% Manual marks
-    MK --> REP
-    MK --> REJ
-    MK --> MTG
-
-    %% Infrastructure connections
-    SC -.-> AP
-    SCT -.-> AP
-    SCT -.-> UP
-    EN -.-> BR
-    GD -.-> CL
-    WM -.-> UP
-    PD -.-> UP
-    CA -.-> UP
-    SC -.-> BT
-    EN -.-> BT
-    PD -.-> BT
-    CA -.-> BT
-
-    %% Reporting reads
-    DL -.-> BT
-    ST -.-> BT
-    SCO -.-> BT
-
-    %% Styling
-    classDef discovery fill:#e1f5fe,stroke:#0288d1
-    classDef enrich fill:#f3e5f5,stroke:#7b1fa2
-    classDef dm fill:#fff3e0,stroke:#f57c00
-    classDef outreach fill:#e8f5e9,stroke:#388e3c
-    classDef monitor fill:#fce4ec,stroke:#c62828
-    classDef report fill:#f5f5f5,stroke:#616161
-    classDef infra fill:#fafafa,stroke:#9e9e9e
-
-    class SC,IE discovery
-    class EN,SCT,LS enrich
-    class GD,QV dm
-    class WM,WAIT,PD,CR,SM outreach
-    class CA,MK monitor
-    class DL,ST,SCO report
+    replied --> meeting_booked
+    meeting_booked --> [*]
+    rejected --> [*]
+    day21_sent --> [*]
 ```
