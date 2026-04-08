@@ -35,8 +35,12 @@ class Settings(BaseSettings):
 
     def check_status(self) -> dict[str, bool]:
         """Return a mapping of field name -> whether it is configured (non-empty)."""
-        return {name: bool(getattr(self, name)) for name in self.model_fields}
+        return {name: bool(getattr(self, name)) for name in Settings.model_fields}
 
 
 def load_settings() -> Settings:
     return Settings()
+
+
+# Alias for convenience
+get_settings = load_settings
