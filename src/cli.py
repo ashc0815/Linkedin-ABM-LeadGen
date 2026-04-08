@@ -1129,6 +1129,371 @@ def pipeline_generate_dms(
 
 
 # ---------------------------------------------------------------------------
+# pipeline warm
+# ---------------------------------------------------------------------------
+
+
+@pipeline_app.command("warm")
+def pipeline_warm(
+    touch: str = typer.Option(..., help="Touch point whose queue to warm (day1, day7, day14, day21)"),
+    limit: int = typer.Option(10, help="Max contacts to warm"),
+) -> None:
+    """Warm engagement before sending DMs — view profiles and like posts."""
+    import random
+
+    from src.bitable_client import CONTACT_FIELD_MAP, BitableClient
+    from src.models import Contact
+    from src.unipile_client import UnipileClient
+
+    if touch not in _TOUCH_STATUS_MAP:
+        console.print(f"[red]Invalid touch: {touch!r}[/red]")
+        raise typer.Exit(1)
+
+    settings = load_settings()
+    unipile_ready = all([settings.unipile_api_key, settings.unipile_dsn, settings.unipile_account_id])
+    if not unipile_ready:
+        console.print("[red]Unipile credentials not set. Aborting.[/red]")
+        raise typer.Exit(1)
+
+    feishu_ready = all([
+        settings.feishu_app_id,
+        settings.feishu_app_secret,
+        settings.feishu_bitable_app_token,
+        settings.feishu_contacts_table_id,
+    ])
+    if not feishu_ready:
+        console.print("[red]Feishu Bitable credentials not fully configured. Aborting.[/red]")
+        raise typer.Exit(1)
+
+    bitable = BitableClient(
+        app_id=settings.feishu_app_id,
+        app_secret=settings.feishu_app_secret,
+        app_token=settings.feishu_bitable_app_token,
+        companies_table_id=settings.feishu_companies_table_id,
+        contacts_table_id=settings.feishu_contacts_table_id,
+    )
+    unipile = UnipileClient(
+        api_key=settings.unipile_api_key,
+        dsn=settings.unipile_dsn,
+        account_id=settings.unipile_account_id,
+    )
+
+    # Fetch contacts in queued state
+    queued_status = f"{touch}_queued"
+    col = CONTACT_FIELD_MAP["dm_status"]
+    formula = f'CurrentValue.[{col}] = "{queued_status}"'
+    raw = bitable.list_records(bitable.contacts_table_id, filter_formula=formula)
+
+    candidates: list[tuple[str, Contact]] = []
+    for rec in raw:
+        try:
+            ct = bitable._fields_to_contact(rec.get("fields", {}))
+            if ct.linkedin_provider_id:
+                candidates.append((rec["record_id"], ct))
+        except Exception:
+            pass
+
+    candidates = candidates[:limit]
+
+    if not candidates:
+        console.print(f"[yellow]No contacts with provider_id in status {queued_status}.[/yellow]")
+        raise typer.Exit(0)
+
+    console.print(
+        f"\n[bold]Warming {len(candidates)} contacts before {touch} DMs...[/bold]\n"
+    )
+
+    viewed = 0
+    liked = 0
+
+    for idx, (_rid, ct) in enumerate(candidates, 1):
+        pid = ct.linkedin_provider_id
+        console.print(
+            f"  [cyan][{idx}/{len(candidates)}][/cyan] {ct.name} ({ct.company_name})",
+            end="",
+        )
+
+        # Step 1: View profile
+        try:
+            if unipile.view_profile(pid):
+                viewed += 1
+                console.print(" — viewed", end="")
+        except Exception:
+            pass
+
+        # Random delay 5-10s
+        delay_view = random.uniform(5, 10)
+        time.sleep(delay_view)
+
+        # Step 2: Like most recent post
+        try:
+            posts = unipile.get_recent_posts(pid, limit=1)
+            if posts:
+                post_id = posts[0].get("id") or posts[0].get("post_id")
+                if post_id and unipile.react_to_post(post_id):
+                    liked += 1
+                    console.print(" — liked post", end="")
+        except Exception:
+            pass
+
+        console.print(" [green]✔[/green]")
+
+        # Random delay 3-8s between contacts
+        if idx < len(candidates):
+            time.sleep(random.uniform(3, 8))
+
+    console.print(
+        f"\n[bold]Warming complete: {viewed} profiles viewed, "
+        f"{liked} posts liked[/bold]"
+    )
+    console.print(
+        "\n[bold yellow]Tip: Wait 2-4 hours before sending DMs "
+        "to let contacts see Tony's profile visit notification.[/bold yellow]"
+    )
+
+
+# ---------------------------------------------------------------------------
+# pipeline push-dms
+# ---------------------------------------------------------------------------
+
+DAILY_SEND_LIMIT = 80
+
+
+@pipeline_app.command("push-dms")
+def pipeline_push_dms(
+    touch: str = typer.Option(..., help="Touch point: day1, day7, day14, day21"),
+    flow_type: Optional[str] = typer.Option(None, "--flow-type", help="Filter by flow_type"),
+    contact_name: Optional[str] = typer.Option(None, "--contact", help="Send to a single contact"),
+    confirm_all: bool = typer.Option(False, "--confirm-all", help="Skip per-message confirmation"),
+    max_sends: int = typer.Option(25, "--max-sends", help="Max messages this session"),
+) -> None:
+    """Send queued DM drafts via Unipile."""
+    from datetime import date, datetime, timedelta, timezone
+
+    from rich.panel import Panel
+
+    from src.bitable_client import CONTACT_FIELD_MAP, BitableClient
+    from src.models import Company, Contact
+    from src.unipile_client import UnipileClient
+
+    if touch not in _TOUCH_STATUS_MAP:
+        console.print(f"[red]Invalid touch: {touch!r}[/red]")
+        raise typer.Exit(1)
+
+    settings = load_settings()
+    unipile_ready = all([settings.unipile_api_key, settings.unipile_dsn, settings.unipile_account_id])
+    if not unipile_ready:
+        console.print("[red]Unipile credentials not set. Aborting.[/red]")
+        raise typer.Exit(1)
+
+    feishu_ready = all([
+        settings.feishu_app_id,
+        settings.feishu_app_secret,
+        settings.feishu_bitable_app_token,
+        settings.feishu_companies_table_id,
+        settings.feishu_contacts_table_id,
+    ])
+    if not feishu_ready:
+        console.print("[red]Feishu Bitable credentials not fully configured. Aborting.[/red]")
+        raise typer.Exit(1)
+
+    bitable = BitableClient(
+        app_id=settings.feishu_app_id,
+        app_secret=settings.feishu_app_secret,
+        app_token=settings.feishu_bitable_app_token,
+        companies_table_id=settings.feishu_companies_table_id,
+        contacts_table_id=settings.feishu_contacts_table_id,
+    )
+    unipile = UnipileClient(
+        api_key=settings.unipile_api_key,
+        dsn=settings.unipile_dsn,
+        account_id=settings.unipile_account_id,
+    )
+
+    # ---- 1. Check daily send count ----
+    today_str = date.today().isoformat()
+    date_col = CONTACT_FIELD_MAP["last_touch_date"]
+    today_formula = f'CurrentValue.[{date_col}] = "{today_str}"'
+    today_records = bitable.list_records(bitable.contacts_table_id, filter_formula=today_formula)
+    sent_today = len(today_records)
+
+    if sent_today >= DAILY_SEND_LIMIT:
+        console.print(
+            f"[bold red]Daily limit reached ({sent_today}/{DAILY_SEND_LIMIT} sent today). "
+            f"Stop to protect the LinkedIn account.[/bold red]"
+        )
+        raise typer.Exit(1)
+
+    remaining = DAILY_SEND_LIMIT - sent_today
+    effective_max = min(max_sends, remaining)
+    if effective_max < max_sends:
+        console.print(
+            f"[yellow]Daily quota: {sent_today}/{DAILY_SEND_LIMIT} used. "
+            f"Capping this session to {effective_max} sends.[/yellow]"
+        )
+
+    # ---- 2. Fetch queued contacts ----
+    queued_status = f"{touch}_queued"
+    if contact_name:
+        name_col = CONTACT_FIELD_MAP["name"]
+        formula = f'CurrentValue.[{name_col}] = "{contact_name}"'
+    else:
+        status_col = CONTACT_FIELD_MAP["dm_status"]
+        formula = f'CurrentValue.[{status_col}] = "{queued_status}"'
+        if flow_type:
+            flow_col = CONTACT_FIELD_MAP["flow_type"]
+            formula = f'AND({formula}, CurrentValue.[{flow_col}] = "{flow_type}")'
+
+    raw_contacts = bitable.list_records(bitable.contacts_table_id, filter_formula=formula)
+
+    contacts_with_ids: list[tuple[str, Contact]] = []
+    for rec in raw_contacts:
+        try:
+            ct = bitable._fields_to_contact(rec.get("fields", {}))
+            contacts_with_ids.append((rec["record_id"], ct))
+        except Exception:
+            pass
+
+    contacts_with_ids.sort(key=lambda x: x[1].lead_score, reverse=True)
+    contacts_with_ids = contacts_with_ids[:effective_max]
+
+    if not contacts_with_ids:
+        console.print(f"[yellow]No contacts in {queued_status} status.[/yellow]")
+        raise typer.Exit(0)
+
+    # Build company lookup
+    raw_co = bitable.list_records(bitable.companies_table_id)
+    companies_map: dict[str, Company] = {}
+    for rec in raw_co:
+        try:
+            c = bitable._fields_to_company(rec.get("fields", {}))
+            companies_map[c.company_name] = c
+        except Exception:
+            pass
+
+    console.print(
+        f"\n[bold]Sending {touch} DMs for {len(contacts_with_ids)} contacts "
+        f"(daily: {sent_today}/{DAILY_SEND_LIMIT})...[/bold]\n"
+    )
+
+    # ---- 3. Send loop ----
+    sent_count = 0
+    failed_count = 0
+    skipped_count = 0
+
+    # Next touch schedule
+    _NEXT_TOUCH_DAYS = {"day1": 7, "day7": 7, "day14": 7, "day21": 0}
+    _SENT_STATUS = {"day1": "day1_sent", "day7": "day7_sent", "day14": "day14_sent", "day21": "day21_sent"}
+
+    for idx, (record_id, ct) in enumerate(contacts_with_ids, 1):
+        # Find the draft for this touch
+        draft_entry = None
+        for d in ct.dm_drafts:
+            if d.get("touch") == touch:
+                draft_entry = d
+                break
+        if not draft_entry:
+            console.print(f"  [dim][{idx}] {ct.name} — no {touch} draft, skipping[/dim]")
+            skipped_count += 1
+            continue
+
+        draft_text = draft_entry["draft"]
+
+        # ---- Review panel ----
+        comp = companies_map.get(ct.company_name)
+        comp_info = f"{comp.industry}, {comp.employee_count} emp" if comp else "—"
+        panel_text = (
+            f"[bold]{ct.name}[/bold] — {ct.title}\n"
+            f"{ct.company_name} ({comp_info})\n"
+            f"Score: {ct.lead_score} | Flow: {ct.flow_type} | Touch: {touch}\n"
+            f"Provider ID: {ct.linkedin_provider_id or '—'}\n\n"
+            f"[italic]{draft_text}[/italic]"
+        )
+        console.print(Panel(panel_text, title=f"[{idx}/{len(contacts_with_ids)}] Review DM", border_style="cyan"))
+
+        # ---- Confirm ----
+        if not confirm_all:
+            action = typer.prompt("Send? [y]es / [s]kip / [e]dit / [q]uit", default="y")
+            action = action.strip().lower()
+            if action == "q":
+                console.print("[yellow]Quitting send session.[/yellow]")
+                break
+            if action == "s":
+                skipped_count += 1
+                continue
+            if action == "e":
+                draft_text = typer.prompt("Enter edited DM text")
+
+        # ---- Send via Unipile ----
+        send_ok = False
+        if not ct.linkedin_provider_id:
+            console.print(f"  [red]No provider_id — cannot send[/red]")
+            failed_count += 1
+            continue
+
+        try:
+            if touch == "day1" and ct.flow_type == "cold_new":
+                # Connection request with note
+                result = unipile.send_connection_request(ct.linkedin_provider_id, note=draft_text)
+                chat_id = result.get("id") or result.get("chat_id")
+                if chat_id:
+                    ct.unipile_chat_id = chat_id
+                send_ok = True
+            else:
+                # Regular message into existing chat
+                if not ct.unipile_chat_id:
+                    # Try to find or create chat
+                    ct.unipile_chat_id = unipile.get_existing_chat(ct.linkedin_provider_id)
+                if not ct.unipile_chat_id:
+                    console.print(f"  [red]No chat found for {ct.name} — cannot send[/red]")
+                    failed_count += 1
+                    continue
+                unipile.send_message(ct.unipile_chat_id, draft_text)
+                send_ok = True
+        except Exception as exc:
+            console.print(f"  [red]Send failed: {exc}[/red]")
+            failed_count += 1
+            continue
+
+        if send_ok:
+            sent_count += 1
+            now = datetime.now(timezone.utc)
+
+            # Update draft sent_at
+            for d in ct.dm_drafts:
+                if d.get("touch") == touch:
+                    d["sent_at"] = now.isoformat()
+                    break
+
+            ct.dm_status = _SENT_STATUS[touch]
+            ct.last_touch_date = now
+            ct.touch_count += 1
+
+            # Schedule next touch
+            next_days = _NEXT_TOUCH_DAYS.get(touch, 0)
+            if next_days > 0:
+                ct.next_touch_date = now + timedelta(days=next_days)
+            else:
+                ct.next_touch_date = None
+
+            # Write back to Bitable
+            try:
+                fields = bitable._contact_to_fields(ct)
+                bitable.update_record(bitable.contacts_table_id, record_id, fields)
+            except Exception as exc:
+                console.print(f"  [red]Bitable update failed: {exc}[/red]")
+
+            console.print(f"  [green]✔ Sent to {ct.name}[/green]")
+
+    # ---- 4. Summary ----
+    console.print(
+        f"\n[bold]Push complete: {sent_count} sent, "
+        f"{skipped_count} skipped, {failed_count} failed "
+        f"(daily total: {sent_today + sent_count}/{DAILY_SEND_LIMIT})[/bold]"
+    )
+
+
+# ---------------------------------------------------------------------------
 # pipeline scores
 # ---------------------------------------------------------------------------
 

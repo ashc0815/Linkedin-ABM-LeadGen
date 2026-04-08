@@ -186,3 +186,156 @@ class TestGetExistingChat:
         params = mock_get.call_args[1]["params"]
         assert params["attendees_ids"] == "pid_abc"
         assert params["account_id"] == "acc_123"
+
+
+# ---------------------------------------------------------------------------
+# view_profile
+# ---------------------------------------------------------------------------
+
+
+class TestViewProfile:
+    def test_success(self, client):
+        with patch.object(client._http, "post", return_value=_mock_response({})):
+            assert client.view_profile("pid_abc") is True
+
+    def test_http_error_returns_false(self, client):
+        with patch.object(client._http, "post", return_value=_mock_response({}, status_code=500)):
+            assert client.view_profile("pid_abc") is False
+
+    def test_posts_to_correct_url(self, client):
+        mock_post = MagicMock(return_value=_mock_response({}))
+        with patch.object(client._http, "post", mock_post):
+            client.view_profile("pid_abc")
+        url = mock_post.call_args[0][0]
+        assert "/api/v1/users/pid_abc/view" in url
+
+
+# ---------------------------------------------------------------------------
+# get_recent_posts
+# ---------------------------------------------------------------------------
+
+
+class TestGetRecentPosts:
+    def test_returns_posts(self, client):
+        data = {"items": [{"id": "post_1", "text": "Hello"}, {"id": "post_2", "text": "World"}]}
+        with patch.object(client._http, "get", return_value=_mock_response(data)):
+            posts = client.get_recent_posts("pid_abc", limit=2)
+        assert len(posts) == 2
+        assert posts[0]["id"] == "post_1"
+
+    def test_empty_on_error(self, client):
+        with patch.object(client._http, "get", return_value=_mock_response({}, status_code=404)):
+            assert client.get_recent_posts("pid_abc") == []
+
+    def test_uses_posts_key(self, client):
+        data = {"posts": [{"id": "p1"}]}
+        with patch.object(client._http, "get", return_value=_mock_response(data)):
+            assert len(client.get_recent_posts("pid_abc")) == 1
+
+
+# ---------------------------------------------------------------------------
+# react_to_post
+# ---------------------------------------------------------------------------
+
+
+class TestReactToPost:
+    def test_success(self, client):
+        with patch.object(client._http, "post", return_value=_mock_response({})):
+            assert client.react_to_post("post_1") is True
+
+    def test_failure(self, client):
+        with patch.object(client._http, "post", return_value=_mock_response({}, status_code=400)):
+            assert client.react_to_post("post_1") is False
+
+    def test_sends_correct_body(self, client):
+        mock_post = MagicMock(return_value=_mock_response({}))
+        with patch.object(client._http, "post", mock_post):
+            client.react_to_post("post_1", reaction="CELEBRATE")
+        body = mock_post.call_args[1]["json"]
+        assert body["reaction_type"] == "CELEBRATE"
+        assert body["account_id"] == "acc_123"
+
+
+# ---------------------------------------------------------------------------
+# send_connection_request
+# ---------------------------------------------------------------------------
+
+
+class TestSendConnectionRequest:
+    def test_returns_chat_data(self, client):
+        resp_data = {"id": "chat_new", "status": "pending"}
+        with patch.object(client._http, "post", return_value=_mock_response(resp_data)):
+            result = client.send_connection_request("pid_abc", note="Hi there")
+        assert result["id"] == "chat_new"
+
+    def test_sends_correct_body(self, client):
+        mock_post = MagicMock(return_value=_mock_response({"id": "c1"}))
+        with patch.object(client._http, "post", mock_post):
+            client.send_connection_request("pid_abc", note="Hello")
+        body = mock_post.call_args[1]["json"]
+        assert body["attendees_ids"] == ["pid_abc"]
+        assert body["text"] == "Hello"
+        assert body["account_id"] == "acc_123"
+
+    def test_no_note(self, client):
+        mock_post = MagicMock(return_value=_mock_response({"id": "c1"}))
+        with patch.object(client._http, "post", mock_post):
+            client.send_connection_request("pid_abc")
+        body = mock_post.call_args[1]["json"]
+        assert "text" not in body
+
+
+# ---------------------------------------------------------------------------
+# send_message
+# ---------------------------------------------------------------------------
+
+
+class TestSendMessage:
+    def test_sends_to_chat(self, client):
+        with patch.object(client._http, "post", return_value=_mock_response({"id": "msg_1"})):
+            result = client.send_message("chat_xyz", "Hello there")
+        assert result["id"] == "msg_1"
+
+    def test_sends_correct_url_and_body(self, client):
+        mock_post = MagicMock(return_value=_mock_response({}))
+        with patch.object(client._http, "post", mock_post):
+            client.send_message("chat_xyz", "Test message")
+        url = mock_post.call_args[0][0]
+        assert "/api/v1/chats/chat_xyz/messages" in url
+        assert mock_post.call_args[1]["json"]["text"] == "Test message"
+
+
+# ---------------------------------------------------------------------------
+# check_pending_invitations
+# ---------------------------------------------------------------------------
+
+
+class TestCheckPendingInvitations:
+    def test_returns_items(self, client):
+        data = {"items": [{"id": "inv_1"}, {"id": "inv_2"}]}
+        with patch.object(client._http, "get", return_value=_mock_response(data)):
+            result = client.check_pending_invitations()
+        assert len(result) == 2
+
+    def test_empty_on_error(self, client):
+        with patch.object(client._http, "get", return_value=_mock_response({}, status_code=500)):
+            assert client.check_pending_invitations() == []
+
+
+# ---------------------------------------------------------------------------
+# withdraw_invitation
+# ---------------------------------------------------------------------------
+
+
+class TestWithdrawInvitation:
+    def test_success(self, client):
+        mock_delete = MagicMock()
+        mock_delete.raise_for_status = MagicMock()
+        mock_delete.json.return_value = {}
+        with patch.object(client._http, "delete", return_value=mock_delete):
+            assert client.withdraw_invitation("inv_1") is True
+
+    def test_failure(self, client):
+        mock_resp = _mock_response({}, status_code=404)
+        with patch.object(client._http, "delete", return_value=mock_resp):
+            assert client.withdraw_invitation("inv_1") is False

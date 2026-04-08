@@ -1,4 +1,4 @@
-"""Unipile API client for LinkedIn profile resolution and messaging."""
+"""Unipile API client for LinkedIn profile resolution, engagement, and messaging."""
 
 from __future__ import annotations
 
@@ -48,6 +48,22 @@ class UnipileClient:
         resp.raise_for_status()
         return resp.json()
 
+    def _post(self, path: str, json_body: dict | None = None) -> dict:
+        """Rate-limited POST request to the Unipile API."""
+        self._rate_limiter.wait()
+        url = f"{self.dsn}{path}"
+        resp = self._http.post(url, headers=self._headers(), json=json_body)
+        resp.raise_for_status()
+        return resp.json()
+
+    def _delete(self, path: str) -> bool:
+        """Rate-limited DELETE request. Returns True on success."""
+        self._rate_limiter.wait()
+        url = f"{self.dsn}{path}"
+        resp = self._http.delete(url, headers=self._headers())
+        resp.raise_for_status()
+        return True
+
     # ------------------------------------------------------------------
     # Profile resolution
     # ------------------------------------------------------------------
@@ -86,11 +102,7 @@ class UnipileClient:
     # ------------------------------------------------------------------
 
     def get_profile(self, provider_id: str) -> dict:
-        """Fetch a full LinkedIn profile with all sections.
-
-        Returns the raw profile dict with keys like headline, about,
-        experience, etc.
-        """
+        """Fetch a full LinkedIn profile with all sections."""
         data = self._get(
             f"/api/v1/users/{provider_id}",
             params={
@@ -115,7 +127,6 @@ class UnipileClient:
         except httpx.HTTPStatusError:
             return False
 
-        # Unipile returns "connection_level" or "distance" depending on version
         distance = data.get("connection_level") or data.get("distance") or 0
         is_first = distance == 1 or str(distance) == "FIRST"
         if is_first:
@@ -127,10 +138,7 @@ class UnipileClient:
     # ------------------------------------------------------------------
 
     def get_existing_chat(self, provider_id: str) -> str | None:
-        """Search for an existing LinkedIn chat with the given provider_id.
-
-        Returns the chat_id if found, else None.
-        """
+        """Search for an existing LinkedIn chat with the given provider_id."""
         try:
             data = self._get(
                 "/api/v1/chats",
@@ -150,13 +158,108 @@ class UnipileClient:
         return None
 
     # ------------------------------------------------------------------
-    # Messaging (kept for later use)
+    # Engagement warming
     # ------------------------------------------------------------------
 
-    def send_message(self, provider_id: str, text: str) -> dict:
-        """Send a LinkedIn DM to the given provider_id."""
-        raise NotImplementedError
+    def view_profile(self, provider_id: str) -> bool:
+        """Visit a LinkedIn profile so the user sees Tony in notifications."""
+        try:
+            self._post(
+                f"/api/v1/users/{provider_id}/view",
+                json_body={"account_id": self.account_id},
+            )
+            logger.info("Viewed profile provider_id=%s", provider_id)
+            return True
+        except httpx.HTTPStatusError as exc:
+            logger.warning("view_profile failed for %s: %d", provider_id, exc.response.status_code)
+            return False
+
+    def get_recent_posts(self, provider_id: str, limit: int = 3) -> list[dict]:
+        """Fetch recent posts by the given user."""
+        try:
+            data = self._get(
+                f"/api/v1/users/{provider_id}/posts",
+                params={"account_id": self.account_id, "limit": limit},
+            )
+        except httpx.HTTPStatusError:
+            return []
+
+        items = data.get("items") or data.get("posts") or []
+        logger.debug("get_recent_posts(%s): %d posts", provider_id, len(items))
+        return items
+
+    def react_to_post(self, post_id: str, reaction: str = "LIKE") -> bool:
+        """React (like) a LinkedIn post."""
+        try:
+            self._post(
+                f"/api/v1/posts/{post_id}/reactions",
+                json_body={
+                    "account_id": self.account_id,
+                    "reaction_type": reaction,
+                },
+            )
+            logger.info("Reacted %s to post %s", reaction, post_id)
+            return True
+        except httpx.HTTPStatusError as exc:
+            logger.warning("react_to_post failed for %s: %d", post_id, exc.response.status_code)
+            return False
+
+    # ------------------------------------------------------------------
+    # Messaging
+    # ------------------------------------------------------------------
+
+    def send_connection_request(self, provider_id: str, note: str | None = None) -> dict:
+        """Send a LinkedIn connection request (cold_new Day 1).
+
+        Returns the chat/invitation dict from the API.
+        """
+        body: dict = {
+            "account_id": self.account_id,
+            "attendees_ids": [provider_id],
+        }
+        if note:
+            body["text"] = note
+        data = self._post("/api/v1/chats", json_body=body)
+        chat_id = data.get("id") or data.get("chat_id")
+        logger.info("Sent connection request to %s, chat_id=%s", provider_id, chat_id)
+        return data
+
+    def send_message(self, chat_id: str, text: str) -> dict:
+        """Send a DM into an existing chat (re_activation + follow-ups)."""
+        data = self._post(
+            f"/api/v1/chats/{chat_id}/messages",
+            json_body={"text": text},
+        )
+        logger.info("Sent message to chat %s (%d chars)", chat_id, len(text))
+        return data
 
     def get_messages(self, chat_id: str) -> list[dict]:
         """List messages in a chat."""
-        raise NotImplementedError
+        data = self._get(
+            f"/api/v1/chats/{chat_id}/messages",
+            params={"account_id": self.account_id},
+        )
+        return data.get("items") or data.get("messages") or []
+
+    # ------------------------------------------------------------------
+    # Invitations
+    # ------------------------------------------------------------------
+
+    def check_pending_invitations(self) -> list[dict]:
+        """List pending outgoing connection requests."""
+        try:
+            data = self._get(
+                "/api/v1/invitations",
+                params={"account_id": self.account_id, "status": "pending"},
+            )
+        except httpx.HTTPStatusError:
+            return []
+        return data.get("items") or data.get("invitations") or []
+
+    def withdraw_invitation(self, invitation_id: str) -> bool:
+        """Withdraw a pending connection request."""
+        try:
+            return self._delete(f"/api/v1/invitations/{invitation_id}")
+        except httpx.HTTPStatusError as exc:
+            logger.warning("withdraw_invitation failed for %s: %d", invitation_id, exc.response.status_code)
+            return False
