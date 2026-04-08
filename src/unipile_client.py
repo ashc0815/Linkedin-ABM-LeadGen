@@ -38,6 +38,15 @@ class UnipileClient:
             max_calls_per_minute=30,
         )
 
+    @classmethod
+    def from_settings(cls, settings) -> "UnipileClient":
+        """Create an UnipileClient from a Settings object."""
+        return cls(
+            api_key=settings.unipile_api_key,
+            dsn=settings.unipile_dsn,
+            account_id=settings.unipile_account_id,
+        )
+
     def _headers(self) -> dict[str, str]:
         return {
             "X-API-KEY": self.api_key,
@@ -78,6 +87,16 @@ class UnipileClient:
         self._check_rate_limit(resp)
         resp.raise_for_status()
         return True
+
+    # ------------------------------------------------------------------
+    # Account info
+    # ------------------------------------------------------------------
+
+    def get_account_info(self) -> dict:
+        """Fetch account details from Unipile."""
+        return self._get(
+            f"/api/v1/accounts/{self.account_id}",
+        )
 
     # ------------------------------------------------------------------
     # Profile resolution
