@@ -276,6 +276,179 @@ def pipeline_scrape_companies(
     )
 
 
+# ---------------------------------------------------------------------------
+# pipeline enrich
+# ---------------------------------------------------------------------------
+
+
+def _enrichment_score(company: "Company") -> int:
+    """Simple 0-100 enrichment quality score."""
+    score = 0
+    if company.sap_user == "Yes":
+        score += 25
+    if company.uses_concur == "Yes":
+        score += 25
+    if company.enrichment_signals.get("recent_news"):
+        score += 15
+    if company.has_overseas_offices:
+        score += 10
+    if company.enrichment_signals.get("tech_stack_clues"):
+        score += 10
+    if company.enrichment_signals.get("website_signals"):
+        score += 10
+    if company.enrichment_signals.get("abn"):
+        score += 5
+    return min(score, 100)
+
+
+@pipeline_app.command("enrich")
+def pipeline_enrich(
+    status: str = typer.Option("未触达", help="Filter companies by outreach_status"),
+    limit: int = typer.Option(50, help="Max companies to enrich"),
+    company: Optional[str] = typer.Option(None, "--company", help="Enrich a single company by name"),
+    force: bool = typer.Option(False, "--force", help="Re-enrich companies that already have signals"),
+) -> None:
+    """Enrich company data via Brave Search and website analysis."""
+    from src.bitable_client import COMPANY_FIELD_MAP, BitableClient
+    from src.enrichment import EnrichmentService, enrichment_summary
+    from src.models import Company
+
+    settings = load_settings()
+    if not settings.brave_search_api_key:
+        console.print("[red]BRAVE_SEARCH_API_KEY not set. Aborting.[/red]")
+        raise typer.Exit(1)
+
+    feishu_ready = all([
+        settings.feishu_app_id,
+        settings.feishu_app_secret,
+        settings.feishu_bitable_app_token,
+        settings.feishu_companies_table_id,
+    ])
+    if not feishu_ready:
+        console.print("[red]Feishu Bitable credentials not fully configured. Aborting.[/red]")
+        raise typer.Exit(1)
+
+    bitable = BitableClient(
+        app_id=settings.feishu_app_id,
+        app_secret=settings.feishu_app_secret,
+        app_token=settings.feishu_bitable_app_token,
+        companies_table_id=settings.feishu_companies_table_id,
+        contacts_table_id=settings.feishu_contacts_table_id,
+    )
+    enricher = EnrichmentService(brave_api_key=settings.brave_search_api_key)
+
+    # ---- 1. Fetch companies from Bitable ----
+    if company:
+        col = COMPANY_FIELD_MAP["company_name"]
+        formula = f'CurrentValue.[{col}] = "{company}"'
+        raw_records = bitable.list_records(bitable.companies_table_id, filter_formula=formula)
+    else:
+        col = COMPANY_FIELD_MAP["outreach_status"]
+        formula = f'CurrentValue.[{col}] = "{status}"'
+        raw_records = bitable.list_records(bitable.companies_table_id, filter_formula=formula)
+
+    if not raw_records:
+        console.print("[yellow]No companies found matching the filter.[/yellow]")
+        raise typer.Exit(0)
+
+    # Parse into (record_id, Company) pairs
+    candidates: list[tuple[str, Company]] = []
+    for rec in raw_records:
+        try:
+            c = bitable._fields_to_company(rec.get("fields", {}))
+            candidates.append((rec["record_id"], c))
+        except Exception as exc:
+            logger_name = rec.get("fields", {}).get(COMPANY_FIELD_MAP["company_name"], "?")
+            console.print(f"[dim]Skipping unparseable record {logger_name}: {exc}[/dim]")
+
+    # ---- 2. Filter already-enriched (unless --force) ----
+    if not force:
+        candidates = [
+            (rid, c) for rid, c in candidates if not c.enrichment_signals
+        ]
+
+    # Apply limit
+    candidates = candidates[:limit]
+
+    if not candidates:
+        console.print("[yellow]No companies need enrichment (use --force to re-enrich).[/yellow]")
+        raise typer.Exit(0)
+
+    console.print(
+        f"\n[bold]Enriching {len(candidates)} companies "
+        f"(~{len(candidates) * 5} Brave API calls, ~{len(candidates) * 5}s)...[/bold]\n"
+    )
+
+    # ---- 3. Enrich each company ----
+    enriched: list[tuple[str, Company]] = []
+    sap_count = 0
+    concur_count = 0
+
+    for idx, (record_id, comp) in enumerate(candidates, 1):
+        console.print(
+            f"[cyan][{idx}/{len(candidates)}][/cyan] Enriching {comp.company_name}...",
+            end=" ",
+        )
+        comp = enricher.enrich_company(comp)
+        enriched.append((record_id, comp))
+
+        summary = enrichment_summary(comp)
+        console.print(f"[green]✅[/green] {summary}")
+
+        if comp.sap_user == "Yes":
+            sap_count += 1
+        if comp.uses_concur == "Yes":
+            concur_count += 1
+
+    # ---- 4. Update Bitable ----
+    console.print(f"\n[bold]Updating {len(enriched)} records in Bitable...[/bold]")
+    update_ok = 0
+    for record_id, comp in enriched:
+        try:
+            fields = bitable._company_to_fields(comp)
+            bitable.update_record(bitable.companies_table_id, record_id, fields)
+            update_ok += 1
+        except Exception as exc:
+            console.print(f"[red]✘ Failed to update {comp.company_name}: {exc}[/red]")
+
+    # ---- 5. Results table ----
+    result_table = Table(title="Enrichment Results")
+    result_table.add_column("公司名", style="cyan", max_width=30)
+    result_table.add_column("SAP?", justify="center")
+    result_table.add_column("Concur?", justify="center")
+    result_table.add_column("新闻数", justify="center")
+    result_table.add_column("海外办公室?", justify="center")
+    result_table.add_column("评分", justify="center")
+
+    for _, comp in enriched:
+        news_count = len(comp.enrichment_signals.get("recent_news", []))
+        score = _enrichment_score(comp)
+
+        sap_badge = "[green]Yes[/green]" if comp.sap_user == "Yes" else "[dim]No[/dim]"
+        concur_badge = "[green]Yes[/green]" if comp.uses_concur == "Yes" else "[dim]No[/dim]"
+        overseas_badge = "[green]Yes[/green]" if comp.has_overseas_offices else "[dim]No[/dim]"
+        score_color = "green" if score >= 50 else "yellow" if score >= 25 else "dim"
+
+        result_table.add_row(
+            comp.company_name[:30],
+            sap_badge,
+            concur_badge,
+            str(news_count) if news_count else "-",
+            overseas_badge,
+            f"[{score_color}]{score}[/{score_color}]",
+        )
+
+    console.print()
+    console.print(result_table)
+
+    # ---- 6. Summary ----
+    console.print(
+        f"\n[bold]Enriched {update_ok}/{len(enriched)} companies, "
+        f"{sap_count} confirmed SAP users, "
+        f"{concur_count} confirmed Concur users[/bold]"
+    )
+
+
 # Allow `python -m src.cli <command>` invocation
 if __name__ == "__main__":
     app()
