@@ -15,6 +15,10 @@ logger = logging.getLogger(__name__)
 _USERNAME_RE = re.compile(r"/in/([^/?#]+)")
 
 
+class UnipileRateLimitError(Exception):
+    """Raised when Unipile returns HTTP 429 (too many requests)."""
+
+
 def extract_username(linkedin_url: str) -> str | None:
     """Extract the username slug from a LinkedIn profile URL."""
     m = _USERNAME_RE.search(linkedin_url)
@@ -40,11 +44,20 @@ class UnipileClient:
             "Accept": "application/json",
         }
 
+    def _check_rate_limit(self, resp: httpx.Response) -> None:
+        """Raise UnipileRateLimitError on HTTP 429."""
+        if resp.status_code == 429:
+            raise UnipileRateLimitError(
+                f"Unipile rate limit hit (429). Retry-After: "
+                f"{resp.headers.get('Retry-After', 'unknown')}"
+            )
+
     def _get(self, path: str, params: dict | None = None) -> dict:
         """Rate-limited GET request to the Unipile API."""
         self._rate_limiter.wait()
         url = f"{self.dsn}{path}"
         resp = self._http.get(url, headers=self._headers(), params=params)
+        self._check_rate_limit(resp)
         resp.raise_for_status()
         return resp.json()
 
@@ -53,6 +66,7 @@ class UnipileClient:
         self._rate_limiter.wait()
         url = f"{self.dsn}{path}"
         resp = self._http.post(url, headers=self._headers(), json=json_body)
+        self._check_rate_limit(resp)
         resp.raise_for_status()
         return resp.json()
 
@@ -61,6 +75,7 @@ class UnipileClient:
         self._rate_limiter.wait()
         url = f"{self.dsn}{path}"
         resp = self._http.delete(url, headers=self._headers())
+        self._check_rate_limit(resp)
         resp.raise_for_status()
         return True
 

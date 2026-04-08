@@ -1257,6 +1257,8 @@ def pipeline_warm(
 # ---------------------------------------------------------------------------
 
 DAILY_SEND_LIMIT = 80
+SEND_DELAY_MIN = 20  # seconds between sends
+SEND_DELAY_MAX = 40
 
 
 @pipeline_app.command("push-dms")
@@ -1268,13 +1270,14 @@ def pipeline_push_dms(
     max_sends: int = typer.Option(25, "--max-sends", help="Max messages this session"),
 ) -> None:
     """Send queued DM drafts via Unipile."""
+    import random
     from datetime import date, datetime, timedelta, timezone
 
     from rich.panel import Panel
 
     from src.bitable_client import CONTACT_FIELD_MAP, BitableClient
     from src.models import Company, Contact
-    from src.unipile_client import UnipileClient
+    from src.unipile_client import UnipileClient, UnipileRateLimitError
 
     if touch not in _TOUCH_STATUS_MAP:
         console.print(f"[red]Invalid touch: {touch!r}[/red]")
@@ -1310,29 +1313,38 @@ def pipeline_push_dms(
         account_id=settings.unipile_account_id,
     )
 
-    # ---- 1. Check daily send count ----
+    # ---- 1. Determine daily limit (warmup vs normal) ----
+    daily_limit = DAILY_SEND_LIMIT
+    if settings.warmup_mode:
+        daily_limit = settings.warmup_daily_limit
+        console.print(
+            f"[yellow]WARMUP MODE active — daily limit: "
+            f"{daily_limit} (set WARMUP_MODE=false after 2 weeks)[/yellow]"
+        )
+
+    # ---- 2. Check daily send count ----
     today_str = date.today().isoformat()
     date_col = CONTACT_FIELD_MAP["last_touch_date"]
     today_formula = f'CurrentValue.[{date_col}] = "{today_str}"'
     today_records = bitable.list_records(bitable.contacts_table_id, filter_formula=today_formula)
     sent_today = len(today_records)
 
-    if sent_today >= DAILY_SEND_LIMIT:
+    if sent_today >= daily_limit:
         console.print(
-            f"[bold red]Daily limit reached ({sent_today}/{DAILY_SEND_LIMIT} sent today). "
+            f"[bold red]Daily limit reached ({sent_today}/{daily_limit} sent today). "
             f"Stop to protect the LinkedIn account.[/bold red]"
         )
         raise typer.Exit(1)
 
-    remaining = DAILY_SEND_LIMIT - sent_today
+    remaining = daily_limit - sent_today
     effective_max = min(max_sends, remaining)
     if effective_max < max_sends:
         console.print(
-            f"[yellow]Daily quota: {sent_today}/{DAILY_SEND_LIMIT} used. "
+            f"[yellow]Daily quota: {sent_today}/{daily_limit} used. "
             f"Capping this session to {effective_max} sends.[/yellow]"
         )
 
-    # ---- 2. Fetch queued contacts ----
+    # ---- 3. Fetch queued contacts ----
     queued_status = f"{touch}_queued"
     if contact_name:
         name_col = CONTACT_FIELD_MAP["name"]
@@ -1373,15 +1385,16 @@ def pipeline_push_dms(
 
     console.print(
         f"\n[bold]Sending {touch} DMs for {len(contacts_with_ids)} contacts "
-        f"(daily: {sent_today}/{DAILY_SEND_LIMIT})...[/bold]\n"
+        f"(daily: {sent_today}/{daily_limit}"
+        f"{' [warmup]' if settings.warmup_mode else ''})...[/bold]\n"
     )
 
-    # ---- 3. Send loop ----
+    # ---- 4. Send loop ----
     sent_count = 0
     failed_count = 0
     skipped_count = 0
+    rate_limited = False
 
-    # Next touch schedule
     _NEXT_TOUCH_DAYS = {"day1": 7, "day7": 7, "day14": 7, "day21": 0}
     _SENT_STATUS = {"day1": "day1_sent", "day7": "day7_sent", "day14": "day14_sent", "day21": "day21_sent"}
 
@@ -1425,24 +1438,25 @@ def pipeline_push_dms(
                 draft_text = typer.prompt("Enter edited DM text")
 
         # ---- Send via Unipile ----
-        send_ok = False
         if not ct.linkedin_provider_id:
             console.print(f"  [red]No provider_id — cannot send[/red]")
             failed_count += 1
             continue
 
+        send_ok = False
         try:
-            if touch == "day1" and ct.flow_type == "cold_new":
-                # Connection request with note
+            if ct.flow_type == "cold_new" and touch == "day1":
+                # Cold new Day 1 → connection request with note
                 result = unipile.send_connection_request(ct.linkedin_provider_id, note=draft_text)
                 chat_id = result.get("id") or result.get("chat_id")
                 if chat_id:
                     ct.unipile_chat_id = chat_id
                 send_ok = True
             else:
-                # Regular message into existing chat
+                # All other cases → send_message into existing chat
+                # (cold_new day7/14/21 means connection was accepted)
+                # (re_activation any touch → already connected)
                 if not ct.unipile_chat_id:
-                    # Try to find or create chat
                     ct.unipile_chat_id = unipile.get_existing_chat(ct.linkedin_provider_id)
                 if not ct.unipile_chat_id:
                     console.print(f"  [red]No chat found for {ct.name} — cannot send[/red]")
@@ -1450,6 +1464,17 @@ def pipeline_push_dms(
                     continue
                 unipile.send_message(ct.unipile_chat_id, draft_text)
                 send_ok = True
+
+        except UnipileRateLimitError:
+            rate_limited = True
+            remaining_queue = len(contacts_with_ids) - idx
+            console.print(
+                f"\n[bold red]429 Rate limit hit! "
+                f"Stopping session immediately. "
+                f"{remaining_queue} contacts still in queue.[/bold red]"
+            )
+            break
+
         except Exception as exc:
             console.print(f"  [red]Send failed: {exc}[/red]")
             failed_count += 1
@@ -1485,12 +1510,24 @@ def pipeline_push_dms(
 
             console.print(f"  [green]✔ Sent to {ct.name}[/green]")
 
-    # ---- 4. Summary ----
+            # Human-like delay between sends (skip after last one)
+            if idx < len(contacts_with_ids):
+                delay = random.uniform(SEND_DELAY_MIN, SEND_DELAY_MAX)
+                console.print(f"  [dim]Waiting {delay:.0f}s...[/dim]")
+                time.sleep(delay)
+
+    # ---- 5. Summary ----
+    total_today = sent_today + sent_count
     console.print(
         f"\n[bold]Push complete: {sent_count} sent, "
         f"{skipped_count} skipped, {failed_count} failed "
-        f"(daily total: {sent_today + sent_count}/{DAILY_SEND_LIMIT})[/bold]"
+        f"(daily total: {total_today}/{daily_limit})[/bold]"
     )
+    if rate_limited:
+        console.print(
+            "[bold red]Session stopped due to 429 rate limit. "
+            "Wait at least 15 minutes before retrying.[/bold red]"
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -331,6 +331,7 @@ class TestWithdrawInvitation:
     def test_success(self, client):
         mock_delete = MagicMock()
         mock_delete.raise_for_status = MagicMock()
+        mock_delete.status_code = 200
         mock_delete.json.return_value = {}
         with patch.object(client._http, "delete", return_value=mock_delete):
             assert client.withdraw_invitation("inv_1") is True
@@ -339,3 +340,37 @@ class TestWithdrawInvitation:
         mock_resp = _mock_response({}, status_code=404)
         with patch.object(client._http, "delete", return_value=mock_resp):
             assert client.withdraw_invitation("inv_1") is False
+
+
+# ---------------------------------------------------------------------------
+# 429 Rate limit handling
+# ---------------------------------------------------------------------------
+
+
+class TestRateLimitHandling:
+    def test_get_raises_on_429(self, client):
+        from src.unipile_client import UnipileRateLimitError
+        mock_resp = MagicMock()
+        mock_resp.status_code = 429
+        mock_resp.headers = {"Retry-After": "60"}
+        with patch.object(client._http, "get", return_value=mock_resp):
+            with pytest.raises(UnipileRateLimitError, match="429"):
+                client._get("/api/v1/test")
+
+    def test_post_raises_on_429(self, client):
+        from src.unipile_client import UnipileRateLimitError
+        mock_resp = MagicMock()
+        mock_resp.status_code = 429
+        mock_resp.headers = {}
+        with patch.object(client._http, "post", return_value=mock_resp):
+            with pytest.raises(UnipileRateLimitError):
+                client._post("/api/v1/test")
+
+    def test_delete_raises_on_429(self, client):
+        from src.unipile_client import UnipileRateLimitError
+        mock_resp = MagicMock()
+        mock_resp.status_code = 429
+        mock_resp.headers = {}
+        with patch.object(client._http, "delete", return_value=mock_resp):
+            with pytest.raises(UnipileRateLimitError):
+                client._delete("/api/v1/test")

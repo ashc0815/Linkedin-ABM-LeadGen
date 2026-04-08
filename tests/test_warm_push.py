@@ -21,6 +21,8 @@ def _make_settings(**overrides):
     s.apify_api_token = ""
     s.anthropic_api_key = ""
     s.brave_search_api_key = ""
+    s.warmup_mode = False
+    s.warmup_daily_limit = 10
     for k, v in overrides.items():
         setattr(s, k, v)
     return s
@@ -205,8 +207,10 @@ class TestPipelinePushDMs:
             "fields": {"公司名称": "TestCorp", "LinkedIn URL": "https://li.com/co/tc/", "行业": "Other", "触达状态": "未触达", "来源": "Apify", "Lead评分": 0},
         }
 
-        with patch("src.cli.load_settings") as mock_settings:
+        with patch("src.cli.load_settings") as mock_settings, \
+             patch("src.cli.time") as mock_time:
             mock_settings.return_value = _make_settings()
+            mock_time.sleep = MagicMock()
 
             from src.bitable_client import BitableClient
             from src.unipile_client import UnipileClient
@@ -259,8 +263,10 @@ class TestPipelinePushDMs:
         }
         contact_record = {"record_id": "r_alice", "fields": contact_fields}
 
-        with patch("src.cli.load_settings") as mock_settings:
+        with patch("src.cli.load_settings") as mock_settings, \
+             patch("src.cli.time") as mock_time:
             mock_settings.return_value = _make_settings()
+            mock_time.sleep = MagicMock()
 
             from src.bitable_client import BitableClient
             from src.unipile_client import UnipileClient
@@ -290,3 +296,223 @@ class TestPipelinePushDMs:
         mock_msg.assert_called_once_with("chat_alice", "Hey Alice!")
         mock_conn.assert_not_called()
         assert "1 sent" in result.output
+
+    def test_cold_day7_uses_send_message(self):
+        """cold_new day7+ → send_message (connection was already accepted)."""
+        import json
+
+        contact_fields = {
+            "姓名": "Carol Wu",
+            "职位": "Head of Finance",
+            "公司名称": "Rio",
+            "LinkedIn URL": "https://linkedin.com/in/carol/",
+            "联系人类型": "Head of Finance",
+            "Flow类型": "cold_new",
+            "DM状态": "day7_queued",
+            "Provider ID": "pid_carol",
+            "Chat ID": "chat_carol",
+            "触达次数": 1,
+            "Lead评分": 60,
+            "DM草稿": json.dumps([
+                {"touch": "day1", "draft": "Sent", "generated_at": "2024-01-01", "sent_at": "2024-01-01"},
+                {"touch": "day7", "draft": "Day 7 follow-up", "generated_at": "2024-01-08", "sent_at": None},
+            ]),
+        }
+        contact_record = {"record_id": "r_carol", "fields": contact_fields}
+
+        with patch("src.cli.load_settings") as mock_settings, \
+             patch("src.cli.time") as mock_time:
+            mock_settings.return_value = _make_settings()
+            mock_time.sleep = MagicMock()
+
+            from src.bitable_client import BitableClient
+            from src.unipile_client import UnipileClient
+
+            list_call = [0]
+
+            def mock_list(table_id, filter_formula=None, page_size=100):
+                list_call[0] += 1
+                if list_call[0] == 1:
+                    return []  # daily count
+                if list_call[0] == 2:
+                    return [contact_record]
+                return []
+
+            with patch.object(BitableClient, "_refresh_token", return_value="fake"), \
+                 patch.object(BitableClient, "list_records", side_effect=mock_list), \
+                 patch.object(BitableClient, "update_record", return_value={}), \
+                 patch.object(UnipileClient, "send_message", return_value={"id": "m1"}) as mock_msg, \
+                 patch.object(UnipileClient, "send_connection_request") as mock_conn:
+
+                from src.cli import app
+                result = runner.invoke(app, [
+                    "pipeline", "push-dms", "--touch", "day7", "--confirm-all",
+                ])
+
+        assert result.exit_code == 0
+        mock_msg.assert_called_once_with("chat_carol", "Day 7 follow-up")
+        mock_conn.assert_not_called()
+
+    def test_429_stops_session(self):
+        """Unipile 429 → immediately stop, report remaining queue."""
+        import json
+        from src.unipile_client import UnipileRateLimitError
+
+        contact_fields = {
+            "姓名": "Eve Jones",
+            "职位": "CFO",
+            "公司名称": "Acme",
+            "LinkedIn URL": "https://linkedin.com/in/eve/",
+            "联系人类型": "CFO",
+            "Flow类型": "re_activation",
+            "DM状态": "day1_queued",
+            "Provider ID": "pid_eve",
+            "Chat ID": "chat_eve",
+            "触达次数": 0,
+            "Lead评分": 90,
+            "DM草稿": json.dumps([{"touch": "day1", "draft": "Hi Eve!", "generated_at": "2024-01-01", "sent_at": None}]),
+        }
+        contact_record = {"record_id": "r_eve", "fields": contact_fields}
+
+        with patch("src.cli.load_settings") as mock_settings, \
+             patch("src.cli.time") as mock_time:
+            mock_settings.return_value = _make_settings()
+            mock_time.sleep = MagicMock()
+
+            from src.bitable_client import BitableClient
+            from src.unipile_client import UnipileClient
+
+            list_call = [0]
+
+            def mock_list(table_id, filter_formula=None, page_size=100):
+                list_call[0] += 1
+                if list_call[0] == 1:
+                    return []  # daily count
+                if list_call[0] == 2:
+                    return [contact_record]  # queued contacts
+                return []  # companies
+
+            with patch.object(BitableClient, "_refresh_token", return_value="fake"), \
+                 patch.object(BitableClient, "list_records", side_effect=mock_list), \
+                 patch.object(UnipileClient, "send_message", side_effect=UnipileRateLimitError("429")):
+
+                from src.cli import app
+                result = runner.invoke(app, [
+                    "pipeline", "push-dms", "--touch", "day1", "--confirm-all",
+                ])
+
+        assert result.exit_code == 0
+        assert "429" in result.output or "rate limit" in result.output.lower()
+        assert "0 sent" in result.output
+
+    def test_warmup_mode_reduces_limit(self):
+        """WARMUP_MODE=true → daily limit is warmup_daily_limit (10)."""
+        # 10 records already sent today → should block
+        today_records = [{"record_id": f"r{i}", "fields": {}} for i in range(10)]
+
+        with patch("src.cli.load_settings") as mock_settings:
+            mock_settings.return_value = _make_settings(warmup_mode=True, warmup_daily_limit=10)
+
+            from src.bitable_client import BitableClient
+
+            call_count = [0]
+
+            def mock_list(table_id, filter_formula=None, page_size=100):
+                call_count[0] += 1
+                if call_count[0] == 1:
+                    return today_records
+                return []
+
+            with patch.object(BitableClient, "_refresh_token", return_value="fake"), \
+                 patch.object(BitableClient, "list_records", side_effect=mock_list):
+
+                from src.cli import app
+                result = runner.invoke(app, [
+                    "pipeline", "push-dms", "--touch", "day1", "--confirm-all",
+                ])
+
+        assert result.exit_code == 1
+        assert "10" in result.output
+        assert "WARMUP" in result.output or "warmup" in result.output.lower()
+
+    def test_warmup_mode_banner_shown(self):
+        """WARMUP_MODE shows banner but proceeds if under limit."""
+        with patch("src.cli.load_settings") as mock_settings:
+            mock_settings.return_value = _make_settings(warmup_mode=True, warmup_daily_limit=10)
+
+            from src.bitable_client import BitableClient
+
+            with patch.object(BitableClient, "_refresh_token", return_value="fake"), \
+                 patch.object(BitableClient, "list_records", return_value=[]):
+
+                from src.cli import app
+                result = runner.invoke(app, [
+                    "pipeline", "push-dms", "--touch", "day1", "--confirm-all",
+                ])
+
+        assert result.exit_code == 0
+        assert "WARMUP" in result.output or "warmup" in result.output.lower()
+
+    def test_sends_with_delay_between_messages(self):
+        """Verify time.sleep is called between sends."""
+        import json
+
+        contacts = []
+        for i, name in enumerate(["A", "B"]):
+            contacts.append({
+                "record_id": f"r_{name}",
+                "fields": {
+                    "姓名": name,
+                    "职位": "CFO",
+                    "公司名称": "Co",
+                    "LinkedIn URL": f"https://linkedin.com/in/{name.lower()}/",
+                    "联系人类型": "CFO",
+                    "Flow类型": "re_activation",
+                    "DM状态": "day1_queued",
+                    "Provider ID": f"pid_{name}",
+                    "Chat ID": f"chat_{name}",
+                    "触达次数": 0,
+                    "Lead评分": 50,
+                    "DM草稿": json.dumps([{"touch": "day1", "draft": f"Hi {name}!", "generated_at": "2024-01-01", "sent_at": None}]),
+                },
+            })
+
+        sleep_calls: list[float] = []
+
+        with patch("src.cli.load_settings") as mock_settings, \
+             patch("src.cli.time") as mock_time:
+            mock_settings.return_value = _make_settings()
+
+            def track_sleep(secs):
+                sleep_calls.append(secs)
+
+            mock_time.sleep = track_sleep
+
+            from src.bitable_client import BitableClient
+            from src.unipile_client import UnipileClient
+
+            list_call = [0]
+
+            def mock_list(table_id, filter_formula=None, page_size=100):
+                list_call[0] += 1
+                if list_call[0] == 1:
+                    return []  # daily count
+                if list_call[0] == 2:
+                    return contacts
+                return []
+
+            with patch.object(BitableClient, "_refresh_token", return_value="fake"), \
+                 patch.object(BitableClient, "list_records", side_effect=mock_list), \
+                 patch.object(BitableClient, "update_record", return_value={}), \
+                 patch.object(UnipileClient, "send_message", return_value={"id": "m"}):
+
+                from src.cli import app
+                result = runner.invoke(app, [
+                    "pipeline", "push-dms", "--touch", "day1", "--confirm-all",
+                ])
+
+        assert result.exit_code == 0
+        assert "2 sent" in result.output
+        # Should have slept at least once between first and second send (20-40s range)
+        assert len(sleep_calls) >= 1
+        assert any(20 <= s <= 40 for s in sleep_calls)

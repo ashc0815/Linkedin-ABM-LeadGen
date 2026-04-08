@@ -19,6 +19,10 @@ class Settings(BaseSettings):
     unipile_account_id: str = ""
     brave_search_api_key: str = ""
 
+    # Safety: warm-up period for new/recently-connected Unipile accounts
+    warmup_mode: bool = False
+    warmup_daily_limit: int = 10
+
     @field_validator("*", mode="before")
     @classmethod
     def strip_whitespace(cls, v: object) -> object:
