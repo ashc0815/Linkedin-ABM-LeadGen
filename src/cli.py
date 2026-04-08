@@ -33,6 +33,7 @@ def pipeline_init() -> None:
     settings = load_settings()
     status = settings.check_status()
 
+    # ---- Environment variables table ----
     table = Table(title="linkedin-abm-agent  Environment Status")
     table.add_column("Service", style="cyan", min_width=28)
     table.add_column("Variable", style="dim")
@@ -59,6 +60,44 @@ def pipeline_init() -> None:
             f"[bold yellow]{configured}/{total} configured. "
             f"Fill in missing variables in .env before running the pipeline.[/bold yellow]"
         )
+
+    # ---- Bitable connection test ----
+    feishu_ready = all([
+        settings.feishu_app_id,
+        settings.feishu_app_secret,
+        settings.feishu_bitable_app_token,
+    ])
+
+    console.print()
+    if not feishu_ready:
+        console.print("[dim]Skipping Bitable connection test (Feishu credentials not set)[/dim]")
+        return
+
+    console.print("[bold]Testing Bitable connection...[/bold]")
+    from src.bitable_client import BitableClient
+
+    client = BitableClient(
+        app_id=settings.feishu_app_id,
+        app_secret=settings.feishu_app_secret,
+        app_token=settings.feishu_bitable_app_token,
+        companies_table_id=settings.feishu_companies_table_id,
+        contacts_table_id=settings.feishu_contacts_table_id,
+    )
+    result = client.test_connection()
+
+    bt_table = Table(title="Bitable Connection Test")
+    bt_table.add_column("Check", style="cyan", min_width=20)
+    bt_table.add_column("Result", justify="center")
+
+    for key, label in [("auth", "认证"), ("companies", "Companies 表"), ("contacts", "Contacts 表")]:
+        if result.get(key):
+            bt_table.add_row(label, "[green]✔ OK[/green]")
+        else:
+            err = result.get(f"{key}_error", result.get("error", "failed"))
+            bt_table.add_row(label, f"[red]✘ {err}[/red]")
+
+    console.print(bt_table)
+    console.print()
 
 
 # Allow `python -m src.cli <command>` invocation
